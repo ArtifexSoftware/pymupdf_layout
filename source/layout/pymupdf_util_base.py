@@ -411,9 +411,9 @@ def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
     """Create structured text page with optimal flags."""
     stext_flags = (
             0
+            | pymupdf.TEXT_PRESERVE_IMAGES
             | pymupdf.TEXT_PRESERVE_WHITESPACE
             | pymupdf.TEXT_PRESERVE_LIGATURES
-            | pymupdf.TEXT_INHIBIT_SPACES
             | pymupdf.TEXT_ACCURATE_BBOXES
             | pymupdf.TEXT_COLLECT_VECTORS
             | pymupdf.TEXT_COLLECT_STYLES
