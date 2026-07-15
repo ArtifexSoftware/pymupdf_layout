@@ -30,21 +30,10 @@ While other tools train machine learning models on rendered page images, PyMuPDF
 
 ## Usage
 
-**PyMuPDF4LLM** utilizes Layout by default and will work behind the scenes to analyse documents and deliver improved results.
-
-
-### Extract Structured data
-
-``` python
-import pymupdf4llm
-source = "your.pdf"
-doc = pymupdf.open(source)
-md = pymupdf4llm.to_markdown(doc)
-json = pymupdf4llm.to_json(doc)
-txt = pymupdf4llm.to_text(doc)
-```
+**PyMuPDF Layout** is used by [PyMuPDF4LLM](https://github.com/pymupdf/pymupdf4llm) to analyze documents and deliver improved results.
 
 
 ## Documentation
 
-**PyMuPDF Layout**  works seamlessly with PyMuPDF4LLM - see the [PyMuPDF4LLM documentation page](https://pymupdf.readthedocs.io/en/latest/pymupdf4llm/).
+**PyMuPDF Layout** is a component of [PyMuPDF4LLM](https://github.com/pymupdf/pymupdf4llm), see the [PyMuPDF4LLM documentation page](https://pymupdf.readthedocs.io/en/latest/pymupdf4llm)
+
