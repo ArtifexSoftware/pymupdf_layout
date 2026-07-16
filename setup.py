@@ -243,7 +243,7 @@ p = pipcl.Package(
         summary = 'PyMuPDF Layout turns PDFs into structured data 10× faster than vision-based tools using AI trained on PDF internals, not images. CPU-only. No GPU required.',
         description = 'README.md',
         description_content_type = 'text/markdown',
-        license = 'Dual Licensed - Polyform Noncommercial or Artifex Commercial License',
+        license = 'Dual Licensed - GNU AFFERO GPL 3.0 or Artifex Commercial License',
         project_url = [
                 'Documentation, https://pymupdf.readthedocs.io/en/latest/pymupdf-layout/',
                 'Source, https://github.com/ArtifexSoftware/pymupdf_layout',
