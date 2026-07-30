@@ -352,7 +352,7 @@ fz_find_visual_table_within_bounds2(fz_context *ctx, fz_stext_page *stext, fz_pa
 		return NULL;
 
 	fz_try(ctx)
-		ret = fz_find_table_within_grid(ctx, stext, xpos, ypos, 999999);
+		ret = fz_find_table_within_grid(ctx, stext, xpos, ypos, 999999, NULL);
 	fz_always(ctx)
 	{
 		fz_free(ctx, xpos);
