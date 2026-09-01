@@ -278,12 +278,7 @@ build_sdist = p.build_sdist
 
 def get_requires_for_build_wheel(config_settings=None):
     ret = list()
-    if PYMUPDF_LAYOUT_SETUP_BUILD_PYMUPDF:
-        log(f'Not requiring default pymupdf=={g_pymupdf_version} because {PYMUPDF_LAYOUT_SETUP_BUILD_PYMUPDF=}.')
-    else:
-        pymupdf_version_override = pipcl.version_override('pymupdf')
-        pipcl.log(f'{pymupdf_version_override=}')
-        ret.append(f'pymupdf=={pymupdf_version_override or g_pymupdf_version}')
+    ret.append(f'pymupdf=={g_pymupdf_version}')
     
     if PYMUPDF_LAYOUT_SETUP_SWIG:
         pass
