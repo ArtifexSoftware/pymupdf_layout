@@ -16,8 +16,6 @@ from ..roi_pooling import (extract_bbox_features_by_roi_pooling,
                            DEFAULT_CLASS_LOGITS_POOLING_OPS)
 from ..pymupdf_util import create_input_data_from_page
 from ..pymupdf_util_edge import get_edge_attr, get_edge_dim, build_edge_index, compute_edge_gap_bboxes
-from .ImageFeatureExtractorV1 import ImageFeatureExtractorV1
-from .ImageFeatureExtractorV2 import ImageFeatureExtractorV2
 from .TableGridExtractor import TableGridExtractor
 from .TableGridExtractorV1A import TableGridExtractorV1A
 from .TableGridExtractorV1B import TableGridExtractorV1B
@@ -25,13 +23,133 @@ from .TableGridExtractorV2 import TableGridExtractorV2
 from .TableGridExtractorV2A import TableGridExtractorV2A
 from .TableGridExtractorV2B import TableGridExtractorV2B
 from .TableGridExtractorV3 import TableGridExtractorV3
+from .TableGridExtractorV5 import TableGridExtractorV5
+from .TableGridExtractorV6 import TableGridExtractorV6
 from .MarkdownGenerator import MarkdownGenerator
 from .MarkdownHTMLTableGenerator import MarkdownHTMLTableGenerator
 from .HTMLGenerator import HTMLGenerator
 from .DefaultSorter import DefaultSorter
-from .common_util import make_session
+from .common_util import make_session, make_image_feature_extractor
 
 IGNORE_FEATURE_NAMES = []
+
+# ----------------------------------------------------------------------------
+# Profile loading helpers
+#
+# A "profile" is an internal (non-user-facing) YAML file that bundles all the
+# constructor options that used to be passed in one by one (feature_set_name,
+# model paths, table grid version, runtime flags, etc). Profiles live under
+# resources/profiles/<profile_name>.yaml. If a requested profile file does not
+# exist, resources/profiles/default.yaml is used instead.
+#
+# Note: self.model_cfg (loaded from model_config_path, see __init__)
+# describes the model itself (data/model definition). The profile described
+# here is a separate, higher level concept: it describes which files and
+# runtime options to use to construct a BoxRFDGNN instance. Keep the two
+# concepts and variable names distinct to avoid confusion.
+# ----------------------------------------------------------------------------
+
+PROFILE_DIR_NAME = 'profiles'
+DEFAULT_PROFILE_NAME = 'default'
+GRID_PROFILES_FILENAME = 'grid_profiles.yaml'
+
+# Registry mapping the extractor_class name used in grid_profiles.yaml to the
+# actual class object. YAML cannot store class references directly, so the
+# profile only stores the string key below.
+GRID_EXTRACTOR_REGISTRY = {
+    'TableGridExtractor': TableGridExtractor,
+    'TableGridExtractorV1A': TableGridExtractorV1A,
+    'TableGridExtractorV1B': TableGridExtractorV1B,
+    'TableGridExtractorV2': TableGridExtractorV2,
+    'TableGridExtractorV2A': TableGridExtractorV2A,
+    'TableGridExtractorV2B': TableGridExtractorV2B,
+    'TableGridExtractorV3': TableGridExtractorV3,
+    'TableGridExtractorV5': TableGridExtractorV5,
+    'TableGridExtractorV6': TableGridExtractorV6,
+}
+
+# Safety net values used only if a key is missing from both the requested
+# profile and the default profile. Internal use only, not meant to be tuned
+# by end users.
+PROFILE_HARD_DEFAULTS = {
+    'feature_set_name': 'imf+rf',
+    'table_grid_model_ver': 'V4',
+    'use_gpu': False,
+    'use_sort': False,
+}
+
+
+def load_yaml_file(path):
+    """Load a single YAML file and return its content as a dict."""
+    with open(path, "rb") as f:
+        return yaml.safe_load(f)
+
+
+def resolve_profile_dict(script_dir, profile_name):
+    """
+    Load a profile YAML by name, falling back to the default profile if the
+    requested profile file does not exist.
+
+    Args:
+        script_dir: base resources directory (same root used for onnx assets)
+        profile_name: name of the profile to load (without .yaml extension)
+
+    Returns:
+        dict: parsed profile content. Never None; missing keys inside the
+        dict are expected and handled by the caller via PROFILE_HARD_DEFAULTS.
+    """
+    profiles_dir = Path(script_dir) / 'resources' / PROFILE_DIR_NAME
+    profile_path = profiles_dir / f'{profile_name}.yaml'
+    default_path = profiles_dir / f'{DEFAULT_PROFILE_NAME}.yaml'
+
+    if not profile_path.exists():
+        profile_path = default_path
+
+    if not profile_path.exists():
+        # Internal misconfiguration: no profile and no default profile file.
+        raise FileNotFoundError(
+            f"Profile file not found: neither '{profile_name}.yaml' nor "
+            f"'{DEFAULT_PROFILE_NAME}.yaml' exist under {profiles_dir}"
+        )
+
+    profile_dict = load_yaml_file(profile_path)
+    return profile_dict or {}
+
+
+def resolve_grid_profiles(script_dir):
+    """Load resources/grid_profiles.yaml and return it as a dict."""
+    grid_profiles_path = Path(script_dir) / 'resources' / GRID_PROFILES_FILENAME
+    return load_yaml_file(grid_profiles_path) or {}
+
+
+def validate_required_files(paths):
+    """
+    Check that every path in the given dict is set and points to an
+    existing file, raising a single clear error otherwise.
+
+    This is meant to catch profile misconfiguration (a missing filename
+    key, or a filename that does not exist on disk) as early and clearly
+    as possible, instead of failing later with a raw FileNotFoundError or
+    TypeError deep inside yaml.safe_load()/onnxruntime.
+
+    Args:
+        paths: dict mapping a descriptive name (used in the error message)
+            to the resolved path (str or None).
+
+    Raises:
+        FileNotFoundError: if any path is None or does not exist.
+    """
+    problems = []
+    for name, path in paths.items():
+        if path is None:
+            problems.append(f"{name}: not set")
+        elif not os.path.exists(path):
+            problems.append(f"{name}: file not found at '{path}'")
+
+    if problems:
+        raise FileNotFoundError(
+            "Invalid or missing profile file(s):\n  " + "\n  ".join(problems)
+        )
 def is_inside(bbox, region, margin=10):
     """Check if bbox is within the region expanded by margin."""
     bx1, by1, bx2, by2 = bbox
@@ -240,48 +358,114 @@ def get_nn_input_from_datadict(data_dict, cfg, return_nn_index=False,
 
 
 class BoxRFDGNN:
-    def __init__(self, config_path=None, model_path=None, imf_model_path=None, table_grid_path=None, feature_set_name='imf+rf',
-                 input_type=None, enable_inference_cache=True, use_gpu=False, use_sort=False,
-                 table_grid_model_ver='V4'):
+    def __init__(self, profile=DEFAULT_PROFILE_NAME, config_path=None, model_path=None, imf_model_path=None,
+                 table_grid_path=None, feature_set_name=None,
+                 input_type=None, enable_inference_cache=None, use_gpu=None, use_sort=None,
+                 table_grid_model_ver=None):
+        """
+        Args:
+            profile: name of a profile YAML under resources/profiles/ that
+                bundles the options below. Defaults to 'default'. If the
+                named profile file is not found, resources/profiles/default.yaml
+                is used instead.
+            config_path, model_path, imf_model_path, table_grid_path,
+            feature_set_name, input_type, use_gpu, use_sort,
+            table_grid_model_ver: explicit overrides. Any value passed here
+                (i.e. not None) takes precedence over the value found in the
+                profile, which in turn takes precedence over the built-in
+                fallback resolution logic below.
+            enable_inference_cache: currently a no-op, kept only for
+                backward compatibility with existing call sites. Not part
+                of the profile schema.
+        """
         script_dir = Path(__file__).resolve().parent.parent
 
-        self.feature_set_name = feature_set_name
+        profile_dict = resolve_profile_dict(script_dir, profile)
+
+        def resolve(explicit_value, key, hard_default=None):
+            """explicit kwarg > profile value > hard default."""
+            if explicit_value is not None:
+                return explicit_value
+            if key in profile_dict and profile_dict[key] is not None:
+                return profile_dict[key]
+            return hard_default
+
+        self.profile_name = profile
+
+        self.feature_set_name = resolve(
+            feature_set_name, 'feature_set_name', PROFILE_HARD_DEFAULTS['feature_set_name']
+        )
         ft_set_names = ['rf', 'imf', 'imf+rf', 'imf+rf+yf', 'rf+jf']
         if self.feature_set_name not in ft_set_names:
             raise ValueError(f"feature_set_name must be one in {str(ft_set_names)}")
 
-        if config_path is None or model_path is None:
-            if self.feature_set_name == 'imf':
-                config_path = f'{script_dir}/resources/onnx/layout_imf1.yaml'
-                model_path = f'{script_dir}/resources/onnx/layout_imf1.onnx'
-            elif self.feature_set_name == 'imf+rf':
-                config_path = f'{script_dir}/resources/onnx/layout_rf2.4.1+imf1.yaml'
-                model_path = f'{script_dir}/resources/onnx/layout_rf2.4.1+imf1.onnx'
-            elif self.feature_set_name == 'rf':
-                config_path = f'{script_dir}/resources/onnx/layout_rf2.4.1.yaml'
-                model_path = f'{script_dir}/resources/onnx/layout_rf2.4.1.onnx'
+        # config_path / model_path / imf_model_path: explicit kwargs (a full
+        # path) always win. Otherwise, the profile provides bare filenames
+        # (config_filename, model_filename, imf_model_filename) under
+        # resources/onnx/, resolved here with script_dir since the profile
+        # YAML itself cannot know the install path. See
+        # resources/profiles/imf1.yaml, rf2.4.1+imf1.yaml, rf2.4.1.yaml for
+        # the three built-in combinations.
+        if config_path is None:
+            config_filename = profile_dict.get('config_filename')
+            if config_filename is not None:
+                config_path = f'{script_dir}/resources/onnx/{config_filename}'
+
+        if model_path is None:
+            model_filename = profile_dict.get('model_filename')
+            if model_filename is not None:
+                model_path = f'{script_dir}/resources/onnx/{model_filename}'
 
         if imf_model_path is None:
-            imf_model_path = f'{script_dir}/resources/onnx/feature_imf1.onnx'
+            imf_model_filename = profile_dict.get('imf_model_filename')
+            if imf_model_filename is not None:
+                imf_model_path = f'{script_dir}/resources/onnx/{imf_model_filename}'
+
+        table_grid_path = resolve(table_grid_path, 'table_grid_path')
+        input_type = resolve(input_type, 'input_type')
+        # NOTE: enable_inference_cache is currently a no-op. The inference
+        # caching mechanism it used to control was removed from this class,
+        # but the parameter is kept in the signature so existing call sites
+        # (including positional callers) do not break. It is intentionally
+        # left out of the profile schema since it has no effect.
+        use_gpu = resolve(use_gpu, 'use_gpu', PROFILE_HARD_DEFAULTS['use_gpu'])
+        use_sort = resolve(use_sort, 'use_sort', PROFILE_HARD_DEFAULTS['use_sort'])
+        table_grid_model_ver = resolve(
+            table_grid_model_ver, 'table_grid_model_ver', PROFILE_HARD_DEFAULTS['table_grid_model_ver']
+        )
+
+        # config_path, model_path, and imf_model_path are no longer derived
+        # from feature_set_name in code. They must be provided either as
+        # explicit constructor args or via the profile (see
+        # resources/profiles/*.yaml). Fail fast and clearly if any of them
+        # is missing or does not point to an existing file.
+        validate_required_files({
+            'config_path': config_path,
+            'model_path': model_path,
+            'imf_model_path': imf_model_path,
+        })
 
         self.imf_model_path = imf_model_path
-        self.config_path = config_path
-        with open(self.config_path, "rb") as f:
-            self.cfg = yaml.safe_load(f)
+        # model_config_path / model_cfg refer to the model's own definition
+        # file (data/model spec), as distinct from the profile loaded above
+        # (which only decides which files and runtime options to use).
+        self.model_config_path = config_path
+        with open(self.model_config_path, "rb") as f:
+            self.model_cfg = yaml.safe_load(f)
 
         # Try get input_type from model config
         if input_type is None:
-            input_type = self.cfg['data'].get('input_type', None)
+            input_type = self.model_cfg['data'].get('input_type', None)
         # If there is no input_type, assign the default value
         if input_type is None:
             input_type = ('text',)
         self.input_type = input_type
 
-        self.data_class_names = self.cfg['data']['class_list']
+        self.data_class_names = self.model_cfg['data']['class_list']
         self.data_class_map = {}
         for i in range(len(self.data_class_names)):
             self.data_class_map[self.data_class_names[i]] = i
-        self.class_priority_list = self.cfg['data']['class_priority']
+        self.class_priority_list = self.model_cfg['data']['class_priority']
 
         # Resolve execution providers based on use_gpu flag
         self._providers = self._resolve_providers(use_gpu)
@@ -289,40 +473,18 @@ class BoxRFDGNN:
         self.model_path = model_path
         self.session = None
         self.load_onnx_model(self.model_path)
-
-        if os.path.exists(imf_model_path):
-            ort_session = make_session(imf_model_path, self._providers)
-            imf_output_names = {o.name for o in ort_session.get_outputs()}
-            if 'reg_coarse' in imf_output_names:
-                self.feature_extractor = ImageFeatureExtractorV2(ort_session)
-            else:
-                self.feature_extractor = ImageFeatureExtractorV1(ort_session)
-        else:
-            self.feature_extractor = None
-
+        self.feature_extractor = make_image_feature_extractor(imf_model_path, self._providers)
         self.table_grid_extractor = None
-        # Define model configurations for table grid versions
-        # Structure: (ExtractorClass, filename, has_conn, h_thresh, v_thresh, nms_min_dist)
-        # Note: If has_conn is True, it uses table_conn_model_path.
-        #       If has_conn is None, conn_onnx_path is set to None explicitly.
-        GRID_MODEL_CONFIGS = {
-            'V1': (TableGridExtractor, 'table_grid_model_v1.onnx', False, 0.3, 0.35, None),
-            'V1A': (TableGridExtractorV1A, 'table_grid_model_v1a.onnx', False, 0.15, 0.2, None),
-            'V1B': (TableGridExtractorV1B, 'table_grid_model_v1a.onnx', False, 0.15, 0.2, None),
-            'V1T': (TableGridExtractor, 'table_grid_model_v1t.onnx', False, 0.5, 0.15, None),
-            'V1T-A': (TableGridExtractorV1A, 'table_grid_model_v1t.onnx', False, 0.0, 0.0, None),
-            'V1T-B': (TableGridExtractorV1B, 'table_grid_model_v1t.onnx', False, 0.25, 0.05, None),
 
-            'V2': (TableGridExtractorV2, 'table_grid_model_v2_grid.onnx', None, 0.3, 0.2, None),
-            'V2A': (TableGridExtractorV2A, 'table_grid_model_v2_grid.onnx', None, 0.2, 0.1, None),
-            'V2B': (TableGridExtractorV2B, 'table_grid_model_v2_grid.onnx', None, 0.2, 0.1, None),
-            'V2C': (TableGridExtractorV2, 'table_grid_model_v2c.onnx', None, 0.2, 0.05, None),
-
-            'V3': (TableGridExtractorV3, 'table_grid_model_v3.onnx', False, 0.35, 0.2, None),
-
-            'V4-DO': (TableGridExtractorV2, 'table_grid_model_v4_do.onnx', None, 0.1, 0.3, 0.01),
-            'V4-EP': (TableGridExtractorV2, 'table_grid_model_v4_ep.onnx', None, 0.2, 0.25, 0.01),
-        }
+        # Grid model configurations for each table_grid_model_ver are loaded
+        # from resources/grid_profiles.yaml instead of being hardcoded here.
+        # Expected per-entry keys: extractor_class, filename, connection_mode,
+        # h_on_threshold, v_on_threshold, nms_min_dist.
+        # connection_mode meaning (same semantics as before):
+        #   true  -> uses a separate table_conn_model_path
+        #   null  -> conn_onnx_path is passed explicitly as None
+        #   false -> extractor_cls is constructed with just the grid model path
+        grid_profiles = resolve_grid_profiles(script_dir)
 
         # Normalize alias for V4
         if table_grid_model_ver == 'V4':
@@ -330,9 +492,14 @@ class BoxRFDGNN:
 
         self.table_grid_extractor = None
 
-        if table_grid_model_ver in GRID_MODEL_CONFIGS:
-            extractor_cls, default_filename, connection_mode, h_thresh, v_thresh, nms_min_dist = GRID_MODEL_CONFIGS[
-                table_grid_model_ver]
+        if table_grid_model_ver in grid_profiles:
+            grid_cfg = grid_profiles[table_grid_model_ver]
+            extractor_cls = GRID_EXTRACTOR_REGISTRY[grid_cfg['extractor_class']]
+            default_filename = grid_cfg['filename']
+            connection_mode = grid_cfg.get('connection_mode', False)
+            h_thresh = grid_cfg['h_on_threshold']
+            v_thresh = grid_cfg['v_on_threshold']
+            nms_min_dist = grid_cfg.get('nms_min_dist')
 
             # Resolve model paths
             table_grid_model_path = table_grid_path if table_grid_path is not None else f'{script_dir}/resources/onnx/{default_filename}'
@@ -362,7 +529,7 @@ class BoxRFDGNN:
             else:
                 self.table_grid_extractor = extractor_cls(table_grid_model_path, **kwargs)
         else:
-            supported_vers = ", ".join(GRID_MODEL_CONFIGS.keys()) + ", V4"
+            supported_vers = ", ".join(grid_profiles.keys()) + ", V4"
             raise ValueError(f"Invalid table_grid_model_ver. Supported versions are: {supported_vers}")
 
 
@@ -415,7 +582,7 @@ class BoxRFDGNN:
         Returns:
             list[str]: Ordered list of input tensor names for the ONNX session.
         """
-        model_option = self.cfg['model']['option']
+        model_option = self.model_cfg['model']['option']
         model_type = model_option['conv_type']
         if isinstance(model_type, list):
             model_type = model_type[0]
@@ -436,15 +603,22 @@ class BoxRFDGNN:
             raise ValueError(f'Not supported model_type = {model_type}!')
 
 
+    @staticmethod
+    def _page_to_image(page):
+        """Rasterize a PyMuPDF page to an (H, W, C) uint8 numpy array."""
+        pix = page.get_pixmap()
+        bytes_data = np.frombuffer(pix.samples, dtype=np.uint8)
+        return bytes_data.reshape(pix.height, pix.width, pix.n)
+
     def is_image_page(self, page):
         """
         Determine whether the page contains significant non-picture content
         detected by the image model (e.g. text, tables printed as images).
 
-        Runs ONNX inference once and caches the result so that the immediately
-        following predict() call reuses it without re-running inference.
-        The cache is single-use: it is consumed and cleared inside
-        image_feature_extraction_task() when predict() is called next.
+        Follows the unified contract of ImageFeatureExtractorV1/V2: predict()
+        is called here exactly once for this page, and its result is
+        immediately consumed by is_image_page(data_dict) within this same
+        call -- never left cached across calls.
 
         Typical usage::
 
@@ -462,7 +636,16 @@ class BoxRFDGNN:
         if self.feature_extractor is None:
             return False
 
-        return self.feature_extractor.is_image_page(page)
+        page_img = self._page_to_image(page)
+        self.feature_extractor.predict(page_img)
+        self.feature_extractor.mark_cached()
+
+        data_dict = create_input_data_from_page(page, options={
+            'input_type': self.input_type,
+            'feature_set_name': self.feature_set_name,
+            'page_img': page_img,
+        })
+        return self.feature_extractor.is_image_page(data_dict)
 
     # ------------------------------------------------------------------
     # Post-processing helpers
@@ -918,109 +1101,163 @@ class BoxRFDGNN:
         return det_result, groups
 
     # ------------------------------------------------------------------
+    # OCR need detection helper
+    # ------------------------------------------------------------------
+
+    def is_page_ocr_needed(self, data_dict, iou_threshold: float = 0.2) -> bool | None:
+        """Delegate OCR need detection to the feature extractor.
+
+        Uses duck-typing so any extractor version that exposes is_ocr_needed()
+        is supported.
+
+        Contract: predict() must already have been called for this page
+        before calling this method (this method does not run inference
+        itself). See BoxRFDGNN.predict() for the call site that guarantees
+        this ordering.
+
+        Args:
+            data_dict     : output of create_input_data_from_page() for this
+                            same page.
+            iou_threshold : passed through to feature_extractor.is_ocr_needed().
+
+        Returns:
+            bool | None -- forwarded from the extractor; None when unavailable.
+        """
+        if self.feature_extractor is None or \
+                not hasattr(self.feature_extractor, 'is_ocr_needed'):
+            return None
+        return self.feature_extractor.is_ocr_needed(data_dict, iou_threshold)
+
+    # ------------------------------------------------------------------
     # Main inference entry point
     # ------------------------------------------------------------------
 
-    def predict(self, page, verbose=False, **kwargs):
-        # Inference
-        groups = None
-        if groups is None:
+    def predict(self, page, verbose=False, data_dict=None, **kwargs):
+        check_ocr_need         = kwargs.get('check_ocr_need',        False)
+        ocr_need_iou_threshold = kwargs.get('ocr_need_iou_threshold', 0.2)
+
+        # ------------------------------------------------------------------
+        # Unified image-feature-extractor contract: predict() is called
+        # exactly once per page, explicitly, before any of is_image_page(),
+        # is_ocr_needed(), or feature extraction consume its cached result.
+        # Needed whenever we build data_dict ourselves (so
+        # image_feature_extraction_task() can reuse this call instead of
+        # running its own) and/or whenever is_page_ocr_needed() will run
+        # below (it requires fresh logits for this exact page).
+        # ------------------------------------------------------------------
+        page_img = None
+        if self.feature_extractor is not None and (data_dict is None or check_ocr_need):
+            page_img = self._page_to_image(page)
+            self.feature_extractor.predict(page_img)
+            self.feature_extractor.mark_cached()
+
+        if data_dict is None:
             data_dict = create_input_data_from_page(page, options={
                 'input_type': self.input_type,
                 'feature_set_name': self.feature_set_name,
                 'feature_extractor': self.feature_extractor,
+                'page_img': page_img,
             })
-            bboxes = np.array(data_dict['bboxes'], dtype=np.float32)
+        bboxes = np.array(data_dict['bboxes'], dtype=np.float32)
 
-            # Empty input
-            if len(bboxes) == 0:
+        # ------------------------------------------------------------------
+        # OCR need detection via text segmentation vs bbox mask IoU
+        # ------------------------------------------------------------------
+        needs_ocr = self.is_page_ocr_needed(data_dict, ocr_need_iou_threshold) \
+            if check_ocr_need else None
+
+        return_raw = kwargs.get('return_raw', False)
+        if len(bboxes) == 0:
+            if return_raw:
+                return {
+                    'groups':    [],
+                    'needs_ocr': needs_ocr,
+                    'node_feat': np.empty((0, 0), dtype=np.float32),
+                    'edge_feat': np.empty((0, 0), dtype=np.float32),
+                }
+            else:
                 return []
 
-            model_type = self.cfg['model']['option']['conv_type']
+        model_type = self.model_cfg['model']['option']['conv_type']
 
-            # Print model type when verbose is enabled
-            if verbose:
-                print(">>> model_type:", model_type)
+        # Print model type when verbose is enabled
+        if verbose:
+            print(">>> model_type:", model_type)
 
-            if type(model_type) is list:
-                model_type = model_type[0]
+        if type(model_type) is list:
+            model_type = model_type[0]
 
-            onnx_input_names = self._onnx_input_names
+        onnx_input_names = self._onnx_input_names
 
-            # Prepare neural network inputs from data_dict.
-            x, edge_index, edge_attr, nn_index, nn_attr, rf_feature, text_feature, image_feature, image_data = \
-                get_nn_input_from_datadict(data_dict, self.cfg, return_nn_index=('nn_index' in onnx_input_names))
+        # Prepare neural network inputs from data_dict.
+        x, edge_index, edge_attr, nn_index, nn_attr, rf_feature, text_feature, image_feature, image_data = \
+            get_nn_input_from_datadict(data_dict, self.model_cfg, return_nn_index=('nn_index' in onnx_input_names))
 
-            # Build ONNX inputs directly from the known name list,
-            # avoiding the intermediate full-dict allocation.
-            _all_inputs = {
-                'x':              x,
-                'edge_index':     edge_index,
-                'edge_attr':      edge_attr,
-                'rf_features':    rf_feature,
-                'k':              np.array(min(len(bboxes), 20), dtype=np.int64),
-                'text_patterns':  text_feature,
-                'image_features': image_feature,
-                'batch':          np.zeros(len(bboxes), dtype=np.int64),
-            }
-            onnx_inputs = {name: _all_inputs[name] for name in onnx_input_names}
+        # Build ONNX inputs directly from the known name list,
+        # avoiding the intermediate full-dict allocation.
+        _all_inputs = {
+            'x':              x,
+            'edge_index':     edge_index,
+            'edge_attr':      edge_attr,
+            'rf_features':    rf_feature,
+            'k':              np.array(min(len(bboxes), 20), dtype=np.int64),
+            'text_patterns':  text_feature,
+            'image_features': image_feature,
+            'batch':          np.zeros(len(bboxes), dtype=np.int64),
+        }
+        onnx_inputs = {name: _all_inputs[name] for name in onnx_input_names}
 
-            # Verbose: print shapes and dtypes of onnx_inputs
-            if verbose:
-                print(">>> onnx_inputs:")
-                for name, val in onnx_inputs.items():
-                    arr = np.asarray(val)
-                    try:
-                        dtype = arr.dtype
-                    except Exception:
-                        dtype = type(val)
-                    print(f"  - {name}: shape={np.shape(arr)}, dtype={dtype}")
-
-            # Verbose: print ONNX session input metadata if session exists
-            if verbose and hasattr(self, 'session') and self.session is not None:
+        # Verbose: print shapes and dtypes of onnx_inputs
+        if verbose:
+            print(">>> onnx_inputs:")
+            for name, val in onnx_inputs.items():
+                arr = np.asarray(val)
                 try:
-                    print(">>> ONNX Runtime session inputs metadata:")
-                    for inp in self.session.get_inputs():
-                        print(f"  - name={inp.name}, shape={inp.shape}, type={inp.type}")
-                    print(">>> ONNX Runtime session outputs metadata:")
-                    for out in self.session.get_outputs():
-                        print(f"  - name={out.name}, shape={out.shape}, type={out.type}")
-                except Exception as e:
-                    print("  (Failed to read session metadata):", e)
+                    dtype = arr.dtype
+                except Exception:
+                    dtype = type(val)
+                print(f"  - {name}: shape={np.shape(arr)}, dtype={dtype}")
 
-            # Run the ONNX model
-            ort_outputs = self.session.run(None, onnx_inputs)
-            onnx_node_logits, onnx_edge_logits = ort_outputs
+        # Verbose: print ONNX session input metadata if session exists
+        if verbose and hasattr(self, 'session') and self.session is not None:
+            try:
+                print(">>> ONNX Runtime session inputs metadata:")
+                for inp in self.session.get_inputs():
+                    print(f"  - name={inp.name}, shape={inp.shape}, type={inp.type}")
+                print(">>> ONNX Runtime session outputs metadata:")
+                for out in self.session.get_outputs():
+                    print(f"  - name={out.name}, shape={out.shape}, type={out.type}")
+            except Exception as e:
+                print("  (Failed to read session metadata):", e)
 
-            # Convert node logits to probabilities by applying softmax
-            exp_node_logits = np.exp(onnx_node_logits - np.max(onnx_node_logits, axis=1, keepdims=True))
-            node_probs = exp_node_logits / np.sum(exp_node_logits, axis=1, keepdims=True)
+        # Run the ONNX model
+        ort_outputs = self.session.run(None, onnx_inputs)
+        onnx_node_logits, onnx_edge_logits, onnx_node_feat, onnx_edge_feat = ort_outputs
 
-            # Predicted node labels and scores
-            predicted_node_label = np.argmax(node_probs, axis=1)
-            predicted_node_score = node_probs[np.arange(node_probs.shape[0]), predicted_node_label]
+        # Convert node logits to probabilities by applying softmax
+        exp_node_logits = np.exp(onnx_node_logits - np.max(onnx_node_logits, axis=1, keepdims=True))
+        node_probs = exp_node_logits / np.sum(exp_node_logits, axis=1, keepdims=True)
 
-            # Edge prediction
-            edge_threshold = kwargs.get('edge_threshold', 0.55)
-            if onnx_edge_logits.size > 0:
-                exp_edge_logits = np.exp(onnx_edge_logits - np.max(onnx_edge_logits, axis=1, keepdims=True))
-                edge_probs = exp_edge_logits / np.sum(exp_edge_logits, axis=1, keepdims=True)
-                predicted_edge_labels = (edge_probs[:, 1] > edge_threshold).astype(np.int64)
-            else:
-                predicted_edge_labels = np.empty(0, dtype=np.int64)
+        # Predicted node labels and scores
+        predicted_node_label = np.argmax(node_probs, axis=1)
+        predicted_node_score = node_probs[np.arange(node_probs.shape[0]), predicted_node_label]
 
-            num_nodes = len(predicted_node_label)
-            edge_matrix = get_edge_matrix(num_nodes, edge_index, predicted_edge_labels)
-            groups = group_node_by_edge(predicted_node_label, predicted_node_score, edge_matrix, bboxes, self.class_priority_list)
+        # Edge prediction
+        edge_threshold = kwargs.get('edge_threshold', 0.55)
+        if onnx_edge_logits.size > 0:
+            exp_edge_logits = np.exp(onnx_edge_logits - np.max(onnx_edge_logits, axis=1, keepdims=True))
+            edge_probs = exp_edge_logits / np.sum(exp_edge_logits, axis=1, keepdims=True)
+            predicted_edge_labels = (edge_probs[:, 1] > edge_threshold).astype(np.int64)
+        else:
+            predicted_edge_labels = np.empty(0, dtype=np.int64)
 
-            # Assign class names to groups immediately after initial grouping
-            for group in groups:
-                group['class_name'] = self.data_class_names[group['group_class']]
+        num_nodes = len(predicted_node_label)
+        edge_matrix = get_edge_matrix(num_nodes, edge_index, predicted_edge_labels)
+        groups = group_node_by_edge(predicted_node_label, predicted_node_score, edge_matrix, bboxes, self.class_priority_list)
 
-        # If groups were loaded from cache or newly generated, proceed with post-processing.
-        # Note: If groups were from cache, they already went through the initial post-processing
-        # but further operations like sorting or table grid extraction might re-run based on flags.
-        
+        for group in groups:
+            group['class_name'] = self.data_class_names[group['group_class']]
+
         # Build det_result from groups. This list will be updated by post-processing steps
         # and needs to be kept in sync with 'groups'.
         det_result = []
@@ -1051,81 +1288,63 @@ class BoxRFDGNN:
             groups     = [groups[i]     for i in order]
             det_result = [det_result[i] for i in order]
             
-        # Enrich groups with class name and table structure
-        # This block is moved here to ensure table grid extraction happens after
-        # all bounding box modifications (expansion, merging, etc.) has been applied.
-        # If groups were loaded from cache, this step is skipped unless explicitly forced
-        # or if the cache doesn't contain table grid data. For simplicity, we rerun it.
-        if groups is not None: # Ensure groups object exists
-            for group in groups:
-                cls_name = group['class_name'] # Class name should already be set
+        for group in groups:
+            cls_name = group['class_name']
 
-                # Attach the raw pymupdf-extracted bboxes (before layout grouping)
-                # that were merged into this group, for detailed inspection via
-                # return_raw. Note this only covers bboxes that ended up in some
-                # group, not raw bboxes that were dropped as noise.
-                group['bboxes'] = [list(data_dict['bboxes'][i]) for i in group['indicies']]
+            # Attach the raw pymupdf-extracted bboxes (before layout grouping)
+            # that were merged into this group, for detailed inspection via
+            # return_raw. Note this only covers bboxes that ended up in some
+            # group, not raw bboxes that were dropped as noise.
+            group['bboxes'] = [list(data_dict['bboxes'][i]) for i in group['indicies']]
 
-                # Check if table grid needs to be processed (e.g., if not already in cache or if it's a table)
-                if self.table_grid_extractor is not None and cls_name == 'table':
-                    # Add this check to prevent redundant calculation for cached groups
-                    if 'table_grid' in group and group['table_grid'] is not None:
-                        continue # Skip if table grid data is already present
+            if self.table_grid_extractor is not None and cls_name == 'table':
+                page_image = data_dict['image']
 
-                    # We need the original data_dict for image and text content
-                    # If groups was from cache, data_dict might not be available,
-                    # so we need to recreate it or ensure it's passed.
-                    # For now, assuming `data_dict` is available from current inference run.
-                    if 'data_dict' not in locals(): # If groups came from cache, data_dict needs to be built
-                         data_dict = create_input_data_from_page(page, options={
-                             'input_type': self.input_type,
-                             'feature_set_name': self.feature_set_name,
-                             'feature_extractor': self.feature_extractor,
-                         })
-                         bboxes = np.array(data_dict['bboxes'], dtype=np.float32)
+                # Use the FINAL group_bbox for cropping and coordinate conversion
+                crop_x0, crop_y0, crop_x1, crop_y1 = group['group_bbox'][:4]
 
-                    page_image = data_dict['image']
-                    
-                    # Use the FINAL group_bbox for cropping and coordinate conversion
-                    crop_x0, crop_y0, crop_x1, crop_y1 = group['group_bbox'][:4]
-                    
-                    # Ensure bbox coordinates are valid integers for slicing
-                    crop_y0_int = max(0, int(crop_y0))
-                    crop_y1_int = min(page_image.shape[0], int(crop_y1))
-                    crop_x0_int = max(0, int(crop_x0))
-                    crop_x1_int = min(page_image.shape[1], int(crop_x1))
-                    
-                    crop_img = page_image[crop_y0_int:crop_y1_int, crop_x0_int:crop_x1_int]
-                    
-                    # The bboxes for ROI pooling are original bboxes, but for table grid,
-                    # we need the bboxes of the text lines *within* this table group.
-                    # These should be converted to crop space using the final table bbox.
-                    group_indices = group['indicies']
-                    group_original_bboxes = np.array([data_dict['bboxes'][i] for i in group_indices])
-                    group_texts = [data_dict['text'][i] for i in group_indices]
+                # Ensure bbox coordinates are valid integers for slicing
+                crop_y0_int = max(0, int(crop_y0))
+                crop_y1_int = min(page_image.shape[0], int(crop_y1))
+                crop_x0_int = max(0, int(crop_x0))
+                crop_x1_int = min(page_image.shape[1], int(crop_x1))
 
-                    # Convert bboxes from page space to crop space relative to the final table bbox
-                    crop_bboxes = group_original_bboxes.copy()
-                    crop_bboxes[:, 0] -= crop_x0
-                    crop_bboxes[:, 2] -= crop_x0
-                    crop_bboxes[:, 1] -= crop_y0
-                    crop_bboxes[:, 3] -= crop_y0
-                    
-                    # If crop_img is empty (e.g., due to extreme expansion clipping), handle gracefully
-                    if crop_img.shape[0] == 0 or crop_img.shape[1] == 0:
-                        group['table_grid'] = None
-                        group['table_cells'] = []
-                    else:
-                        grid, cells = self.table_grid_extractor.predict(
-                            crop_img, crop_bboxes,
-                            texts=group_texts,
-                        )
-                        group['table_grid'] = grid
-                        group['table_cells'] = cells
+                crop_img = page_image[crop_y0_int:crop_y1_int, crop_x0_int:crop_x1_int]
 
-        return_raw = kwargs.get('return_raw', False)
+                # Collect bboxes and texts of lines within this table group,
+                # then convert from page space to crop space.
+                group_indices = group['indicies']
+                group_original_bboxes = np.array([data_dict['bboxes'][i] for i in group_indices])
+                group_texts = [data_dict['text'][i] for i in group_indices]
+
+                crop_bboxes = group_original_bboxes.copy()
+                crop_bboxes[:, 0] -= crop_x0
+                crop_bboxes[:, 2] -= crop_x0
+                crop_bboxes[:, 1] -= crop_y0
+                crop_bboxes[:, 3] -= crop_y0
+
+                # If crop_img is empty (e.g., due to extreme expansion clipping), handle gracefully
+                if crop_img.shape[0] == 0 or crop_img.shape[1] == 0:
+                    group['table_grid'] = None
+                    group['table_cells'] = []
+                else:
+                    grid, cells = self.table_grid_extractor.predict(
+                        crop_img, crop_bboxes,
+                        texts=group_texts,
+                    )
+                    group['table_grid'] = grid
+                    group['table_cells'] = cells
+
+        # ------------------------------------------------------------------
+        # Return
+        # ------------------------------------------------------------------
         if return_raw:
-            return groups
+            return {
+                'groups':    groups,
+                'needs_ocr': needs_ocr,
+                'node_feat': onnx_node_feat,
+                'edge_feat': onnx_edge_feat,
+            }
 
         return det_result
 

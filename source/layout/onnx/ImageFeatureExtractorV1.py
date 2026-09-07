@@ -2,9 +2,23 @@
 ImageFeatureExtractorV1
 Purpose: ONNX-based image feature extraction and segmentation-based bbox detection.
 
+Calling contract:
+    predict(page_img) must be called explicitly by the caller for every page,
+    exactly once per page, BEFORE is_image_page() / is_ocr_needed() /
+    get_feature_map() / get_class_logits() / get_picture_detections() are
+    used. Neither is_image_page() nor is_ocr_needed() runs inference
+    themselves -- they only read the state set by the most recent predict()
+    call, plus a data_dict (from create_input_data_from_page()) for the
+    page-level signals they additionally need:
+        predict(page_img)
+        is_image_page(data_dict)   # or: is_ocr_needed(data_dict)
+    This guarantees predict() runs exactly once per page and that both query
+    methods always observe the current page's state (see BoxRFDGNN.predict()
+    for the call site that owns this sequencing).
+
 CCL execution strategy (lazy):
-    predict()               -> ONNX inference only. CCL is NOT run.
-    is_image_page(page_img) -> runs predict() + non-picture CCL only.
+    predict()             -> ONNX inference only. CCL is NOT run.
+    is_image_page()        -> non-picture CCL only (predict() already done).
     get_picture_detections()-> runs picture CCL on first call after predict().
 
 This minimises redundant work across three usage patterns:
@@ -12,16 +26,17 @@ This minimises redundant work across three usage patterns:
   Pattern A  is_image_page() -> False (common case)
              ONNX: 1,  CCL: 1 (non-picture only)
 
-  Pattern B  is_image_page() -> True -> predict() -> get_picture_detections()
+  Pattern B  is_image_page() -> True -> get_picture_detections()
              ONNX: 1,  CCL: 2 (non-picture + picture, each once)
 
   Pattern C  predict() -> get_feature_map() only
              ONNX: 1,  CCL: 0
 
 Cache protocol (single-use):
-    mark_cached() / consume_cache() -> let BoxRFDGNN.is_image_page() signal
-    that ONNX inference has already run, so the next
-    image_feature_extraction_task() call skips predict().
+    mark_cached() / consume_cache() -> let the caller's explicit predict()
+    call (see calling contract above) signal that ONNX inference has already
+    run for this page, so the next image_feature_extraction_task() call
+    skips a redundant predict().
 
 ONNX output contract (matches ImageFeatureExtractorV2):
     'combined' -- (1, 5*F, H, W) concatenated decoder feature maps
@@ -236,13 +251,13 @@ class ImageFeatureExtractorV1:
         """
         return self._logits
 
-    def is_image_page(self, page):
+    def is_image_page(self, data_dict):
         """
         Determine whether the page is an image-only PDF page that requires OCR.
 
         Returns True only when ALL three conditions hold:
-          1. The page contains at least one raster image (pymupdf).
-          2. The page contains no embedded selectable text (pymupdf).
+          1. The page contains at least one raster image.
+          2. The page contains no embedded selectable text.
           3. The segmentation model detects at least one non-picture region
              (text, table, header, etc.) inside the page image.
 
@@ -250,31 +265,28 @@ class ImageFeatureExtractorV1:
         Condition 3 confirms there is recoverable content inside the image.
         All three must hold for OCR to be both necessary and worthwhile.
 
-        Calls predict() internally and marks the result as cached so the
-        immediately following BoxRFDGNN.predict() skips re-running inference.
+        Contract: predict() must already have been called for this page
+        before calling this method (this method does not run inference
+        itself). Callers should follow the pattern:
+            feature_extractor.predict(page_img)
+            feature_extractor.is_image_page(data_dict)
         picture CCL is deferred to get_picture_detections() if needed.
 
         Args:
-            page: PyMuPDF page object
+            data_dict: output of create_input_data_from_page(), providing
+                       'has_raster_image' and 'has_embedded_text' (raw,
+                       input_type-independent page-level signals).
 
         Returns:
             bool
         """
         # Condition 1: page must contain at least one raster image
-        if not page.get_image_info():
+        if not data_dict['has_raster_image']:
             return False
 
         # Condition 2: page must have no embedded selectable text
-        if page.get_text("text").strip():
+        if data_dict['has_embedded_text']:
             return False
-
-        # Run ONNX inference on the page pixmap and cache the result
-        pix        = page.get_pixmap()
-        bytes_data = np.frombuffer(pix.samples, dtype=np.uint8)
-        page_img   = bytes_data.reshape(pix.height, pix.width, pix.n)
-
-        self.predict(page_img)
-        self.mark_cached()
 
         # Condition 3: segmentation model must detect non-picture content
         self._ensure_non_picture_detections()
@@ -283,6 +295,100 @@ class ImageFeatureExtractorV1:
             d['score'] > _DETECTION_SCORE_THRESHOLD
             for d in self._detections_non_picture
         )
+
+
+    def is_ocr_needed(self, data_dict, iou_threshold: float = 0.4) -> bool | None:
+        """
+        Estimate whether the page likely needs OCR by comparing PDF-extracted
+        bbox positions against a content mask derived from layout segmentation.
+
+        Unlike is_image_page() -- which detects fully scanned pages with no
+        embedded text at all -- this method also catches pages where PDF
+        parsing has only partially extracted the text (some regions missing).
+
+        Uses _logits (layout segmentation) instead of a dedicated text
+        segmentation head (V2). The content mask treats all non-background,
+        non-picture classes as content, filtered by a confidence threshold to
+        suppress false positives in blank regions where any class wins by a
+        slim margin.
+
+        Contract: predict() must already have been called for this page
+        before calling this method (this method does not run inference
+        itself). Callers should follow the pattern:
+            feature_extractor.predict(page_img)
+            feature_extractor.is_ocr_needed(data_dict)
+
+        Args:
+            data_dict     : output of create_input_data_from_page() for this
+                            same page (provides 'image' and 'bboxes').
+            iou_threshold : mask IoU below this value triggers True.
+                            Default 0.4 (higher than V2's 0.2 because the
+                            layout seg mask is coarser than a text-seg head).
+
+        Returns:
+            True  -- low overlap; page likely needs OCR.
+            False -- sufficient overlap; OCR probably not needed.
+            None  -- predict() not yet called or logits unavailable.
+        """
+        if self._logits is None:
+            return None
+
+        try:
+            page_image = data_dict['image']
+            img_h, img_w = page_image.shape[:2]
+
+            # Build bbox binary mask at page image resolution.
+            # Only include bboxes whose box_type is 'text'; skip all others
+            # (e.g. 'table_img_line') because they are not PDF-extracted text
+            # and would produce spurious mask coverage that inflates IoU.
+            box_types = data_dict.get('box_type', [None] * len(data_dict['bboxes']))
+            bbox_mask = np.zeros((img_h, img_w), dtype=np.bool_)
+            for (x0, y0, x1, y1), box_type in zip(data_dict['bboxes'], box_types):
+                if not isinstance(box_type, str) or box_type != 'text':
+                    continue
+                r0 = max(0, int(y0))
+                r1 = min(img_h, int(np.ceil(y1)))
+                c0 = max(0, int(x0))
+                c1 = min(img_w, int(np.ceil(x1)))
+                if r1 > r0 and c1 > c0:
+                    bbox_mask[r0:r1, c0:c1] = True
+
+            # Derive content mask from layout segmentation logits.
+            # Apply softmax to get per-class probabilities.
+            logits = self._logits[0]                          # (C, H, W)
+            logits_shifted = logits - logits.max(axis=0, keepdims=True)
+            exp_logits = np.exp(logits_shifted)
+            probs = exp_logits / exp_logits.sum(axis=0, keepdims=True)  # (C, H, W)
+
+            confidence = probs.max(axis=0)                    # (H, W)
+            pred_class = probs.argmax(axis=0)                 # (H, W)
+
+            # Exclude background and picture; keep all other content classes.
+            bg_idx      = _CLASS_NAMES.index(_BACKGROUND_CLASS)
+            picture_idx = _CLASS_NAMES.index(_PICTURE_CLASS)
+            non_content = {bg_idx, picture_idx}
+            content_mask_feat = (
+                ~np.isin(pred_class, list(non_content)) &
+                (confidence >= _DETECTION_SCORE_THRESHOLD)
+            )
+
+            # Resize content mask from model resolution to page image resolution.
+            feat_h, feat_w = content_mask_feat.shape
+            if feat_h != img_h or feat_w != img_w:
+                row_idx = (np.arange(img_h) * feat_h / img_h).astype(np.int32)
+                col_idx = (np.arange(img_w) * feat_w / img_w).astype(np.int32)
+                content_mask = content_mask_feat[np.ix_(row_idx, col_idx)]
+            else:
+                content_mask = content_mask_feat
+
+            # Both masks empty: no text in PDF or image -> no OCR needed.
+            intersection = np.count_nonzero(bbox_mask & content_mask)
+            union        = np.count_nonzero(bbox_mask | content_mask)
+            iou = intersection / union if union > 0 else 1.0
+            return bool(iou < iou_threshold)
+
+        except Exception:
+            return None
 
     def get_picture_detections(self):
         """

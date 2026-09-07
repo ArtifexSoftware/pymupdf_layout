@@ -115,10 +115,10 @@ class MultiProcessWrapper:
         imf_model_path       : Optional[str] = None,
         feature_set_name     : str = 'imf+rf',
         input_type           : Optional[tuple] = None,
-        n_workers            : int = 4,
+        n_workers            : int = 1,
         use_gpu              : bool = False,
         use_sort             : bool = False,
-        table_grid_model_ver : str = 'V1',
+        table_grid_model_ver : str = 'V4',
     ) -> None:
         from .onnx.BoxRFDGNN import BoxRFDGNN
 
@@ -137,7 +137,8 @@ class MultiProcessWrapper:
 
         self._n_workers = n_workers
         self._worker_args = (
-            self._model.config_path,
+            # self._model.model_config_path,
+            self._model.model_config_path,
             self._model.model_path,
             self._model.imf_model_path,
             self._model.feature_set_name,
@@ -152,8 +153,12 @@ class MultiProcessWrapper:
     def is_image_page(self, page) -> bool:
         return self._model.is_image_page(page)
 
-    def predict(self, page, **kwargs):
-        return self._model.predict(page, **kwargs)
+    def is_page_ocr_needed(self, page, data_dict=None,
+                           iou_threshold: float = 0.2) -> "bool | None":
+        return self._model.is_page_ocr_needed(page, data_dict, iou_threshold)
+
+    def predict(self, page, data_dict=None, **kwargs):
+        return self._model.predict(page, data_dict=data_dict, **kwargs)
 
     def to_markdown(
         self,

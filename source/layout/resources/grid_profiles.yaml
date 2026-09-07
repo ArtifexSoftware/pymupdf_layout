@@ -1,0 +1,170 @@
+# Table grid extractor configurations, keyed by table_grid_model_ver.
+#
+# Each entry corresponds to one previously hardcoded tuple in
+# BoxRFDGNN.__init__ (GRID_MODEL_CONFIGS):
+#   (ExtractorClass, filename, connection_mode, h_thresh, v_thresh, nms_min_dist)
+#
+# Fields:
+#   extractor_class:  string key into GRID_EXTRACTOR_REGISTRY (BoxRFDGNN.py)
+#   filename:         default onnx filename under resources/onnx/, used when
+#                      table_grid_path is not explicitly given
+#   connection_mode:  true  -> a separate table_grid_model_v2_conn.onnx is
+#                               loaded as the connection model
+#                     false -> no connection model, plain constructor call
+#                     null  -> conn_onnx_path is passed explicitly as None
+#   h_on_threshold, v_on_threshold: extractor thresholds
+#   nms_min_dist:     optional, omit or set null if not applicable
+#
+# The alias 'V4' (used as table_grid_model_ver='V4') maps to 'V4-EP' in code.
+
+V1:
+  extractor_class: TableGridExtractor
+  filename: table_grid_model_v1.onnx
+  connection_mode: false
+  h_on_threshold: 0.3
+  v_on_threshold: 0.35
+  nms_min_dist: null
+
+V1A:
+  extractor_class: TableGridExtractorV1A
+  filename: table_grid_model_v1a.onnx
+  connection_mode: false
+  h_on_threshold: 0.15
+  v_on_threshold: 0.2
+  nms_min_dist: null
+
+V1B:
+  extractor_class: TableGridExtractorV1B
+  filename: table_grid_model_v1a.onnx
+  connection_mode: false
+  h_on_threshold: 0.15
+  v_on_threshold: 0.2
+  nms_min_dist: null
+
+V1T:
+  extractor_class: TableGridExtractor
+  filename: table_grid_model_v1t.onnx
+  connection_mode: false
+  h_on_threshold: 0.5
+  v_on_threshold: 0.15
+  nms_min_dist: null
+
+V1T-A:
+  extractor_class: TableGridExtractorV1A
+  filename: table_grid_model_v1t.onnx
+  connection_mode: false
+  h_on_threshold: 0.0
+  v_on_threshold: 0.0
+  nms_min_dist: null
+
+V1T-B:
+  extractor_class: TableGridExtractorV1B
+  filename: table_grid_model_v1t.onnx
+  connection_mode: false
+  h_on_threshold: 0.25
+  v_on_threshold: 0.05
+  nms_min_dist: null
+
+V2:
+  extractor_class: TableGridExtractorV2
+  filename: table_grid_model_v2_grid.onnx
+  connection_mode: null
+  h_on_threshold: 0.3
+  v_on_threshold: 0.2
+  nms_min_dist: null
+
+V2A:
+  extractor_class: TableGridExtractorV2A
+  filename: table_grid_model_v2_grid.onnx
+  connection_mode: null
+  h_on_threshold: 0.2
+  v_on_threshold: 0.1
+  nms_min_dist: null
+
+V2B:
+  extractor_class: TableGridExtractorV2B
+  filename: table_grid_model_v2_grid.onnx
+  connection_mode: null
+  h_on_threshold: 0.2
+  v_on_threshold: 0.1
+  nms_min_dist: null
+
+V2C:
+  extractor_class: TableGridExtractorV2
+  filename: table_grid_model_v2c.onnx
+  connection_mode: null
+  h_on_threshold: 0.2
+  v_on_threshold: 0.05
+  nms_min_dist: null
+
+V3:
+  extractor_class: TableGridExtractorV3
+  filename: table_grid_model_v3.onnx
+  connection_mode: false
+  h_on_threshold: 0.35
+  v_on_threshold: 0.2
+  nms_min_dist: null
+
+V4-DO:
+  extractor_class: TableGridExtractorV2
+  filename: table_grid_model_v4_do.onnx
+  connection_mode: null
+  h_on_threshold: 0.1
+  v_on_threshold: 0.3
+  nms_min_dist: 0.01
+
+V4-EP:
+  extractor_class: TableGridExtractorV2
+  filename: table_grid_model_v4_ep.onnx
+  connection_mode: null
+  h_on_threshold: 0.2
+  v_on_threshold: 0.25
+  nms_min_dist: 0.01
+
+V5-SH100:
+  extractor_class: TableGridExtractorV5
+  filename: table_grid_model_v5_sh100.onnx
+  connection_mode: null
+  h_on_threshold: 0.2
+  v_on_threshold: 0.3
+  nms_min_dist: 0.01
+
+V5-SH100-4L:
+  extractor_class: TableGridExtractorV5
+  filename: table_grid_model_v5_sh100_4L.onnx
+  connection_mode: null
+  h_on_threshold: 0.15
+  v_on_threshold: 0.3
+  nms_min_dist: 0.01
+
+V5-SH100-8L:
+  extractor_class: TableGridExtractorV5
+  filename: table_grid_model_v5_sh100_8L.onnx
+  connection_mode: null
+  h_on_threshold: 0.2
+  v_on_threshold: 0.25
+  nms_min_dist: 0.01
+
+V5-SH100-12L:
+  extractor_class: TableGridExtractorV5
+  filename: table_grid_model_v5_sh100_12L.onnx
+  connection_mode: null
+  h_on_threshold: 0.15
+  v_on_threshold: 0.2
+  nms_min_dist: 0.01
+
+V5-SH180:
+  extractor_class: TableGridExtractorV5
+  filename: table_grid_model_v5_sh180.onnx
+  connection_mode: null
+  h_on_threshold: 0.15
+  v_on_threshold: 0.3
+  nms_min_dist: 0.01
+
+V6-SH100:
+  extractor_class: TableGridExtractorV6
+  filename: table_grid_model_v6_sh100.onnx
+  connection_mode: null
+  h_on_threshold: 0.05
+  v_on_threshold: 0.2
+  nms_min_dist: 0.01

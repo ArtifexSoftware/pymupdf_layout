@@ -1,0 +1,19 @@
+# imf1 profile: image-feature-only model.
+# Replaces the old hardcoded branch: feature_set_name == 'imf'.
+
+feature_set_name: imf
+
+# Bare filenames under resources/onnx/. Resolved with script_dir at
+# construction time (see BoxRFDGNN.__init__), since a YAML file cannot
+# embed the install-specific script_dir itself.
+config_filename: layout_imf1.yaml
+model_filename: layout_imf1.onnx
+
+imf_model_filename: feature_imf1.onnx
+table_grid_path: null
+
+table_grid_model_ver: V1
+input_type: null
+
+use_gpu: false
+use_sort: false

@@ -53,7 +53,7 @@ class MarkdownGenerator:
         from ..pymupdf_util import create_input_data_from_page
 
         if groups is None:
-            groups = self.model.predict(page, return_raw=True)
+            groups = self.model.predict(page, return_raw=True)['groups']
         if not groups:
             return "" if join else []
 

@@ -1086,6 +1086,310 @@ def compute_iou(box1, box2):
 
     return inter_area / union_area if union_area > 0 else 0
 
+def extract_sobel_line_from_image(page_img, page_width, page_height,
+                                  threshold=30, min_length_ratio=0.03,
+                                  max_thickness=1):
+    """
+    Detect horizontal and vertical lines from a rasterized page image using
+    Sobel edge detection + run-length encoding. Pure numpy, no OpenCV dependency.
+
+    Intended as an image-processing-based alternative to vec_line extraction
+    (get_vector_lines), which relies on PDF drawing objects and is sensitive
+    to how the PDF author chose to render lines (vector path, filled rect,
+    embedded image, etc.).
+
+    Pipeline per direction:
+        1. Convert page_img to grayscale (luminance-weighted).
+        2. Apply 1-D Sobel kernel along the axis perpendicular to the line
+           direction to detect edges (e.g. horizontal Sobel dY for horizontal
+           lines: high response at top/bottom edge of a dark horizontal band).
+        3. Threshold the absolute response to get a binary edge map.
+        4. For each row (horizontal) or column (vertical), run run-length
+           encoding to find contiguous foreground runs.
+        5. For runs long enough (>= min_length_ratio * page dimension), record
+           the enclosing bbox in PDF coordinate space (scaled from pixel space).
+
+    Coordinate conversion:
+        Pixel coords are scaled back to PDF point space using page_width /
+        page_height divided by the image pixel dimensions, matching the
+        same coordinate space used by get_vector_lines() and
+        extract_base_elements().
+
+    Args:
+        page_img:         np.ndarray (H, W, C) uint8 -- page raster image as
+                          stored in data_dict['image'].
+        page_width:       float -- PDF page width in points (data_dict['page_width']).
+        page_height:      float -- PDF page height in points (data_dict['page_height']).
+        threshold:        int -- Sobel response magnitude cutoff [0, 255].
+                          Lower values catch faint lines but increase false
+                          positives from text strokes. 30 is a reasonable
+                          starting point for clean PDF renders.
+        min_length_ratio: float -- minimum line length as a fraction of the
+                          page dimension (page_width for h-lines, page_height
+                          for v-lines). 0.03 = 3% of page dimension, which
+                          filters out short text-stroke artifacts while keeping
+                          table ruling lines.
+        max_thickness:    int -- maximum pixel thickness of a detected line
+                          bbox. Sobel response can span a few pixels on either
+                          side of a stroke; this caps how tall/wide a returned
+                          bbox can be in the perpendicular axis, keeping line
+                          bboxes thin and consistent with vec_line output.
+
+    Returns:
+        h_lines: list of [x1, y1, x2, y2] in PDF point space (horizontal lines).
+        v_lines: list of [x1, y1, x2, y2] in PDF point space (vertical lines).
+    """
+    img_h, img_w = page_img.shape[0], page_img.shape[1]
+
+    # Step 1: grayscale (luminance-weighted, no cv2)
+    if page_img.ndim == 3 and page_img.shape[2] >= 3:
+        gray = (0.299 * page_img[:, :, 0].astype(np.float32)
+                + 0.587 * page_img[:, :, 1].astype(np.float32)
+                + 0.114 * page_img[:, :, 2].astype(np.float32))
+    else:
+        gray = page_img[:, :, 0].astype(np.float32) if page_img.ndim == 3 else page_img.astype(np.float32)
+
+    # Scale factors: pixel -> PDF points
+    sx = page_width / img_w
+    sy = page_height / img_h
+
+    # Step 2: 1-D Sobel kernels (3-tap: [-1, 0, 1] along the perpendicular axis)
+    # For horizontal lines: detect edges in Y direction (dY)
+    # For vertical lines:   detect edges in X direction (dX)
+    sobel_y = np.array([[-1], [0], [1]], dtype=np.float32)  # (3,1) kernel
+    sobel_x = np.array([[-1, 0, 1]], dtype=np.float32)       # (1,3) kernel
+
+    def _convolve_rows(img, kernel):
+        """Apply a (K,1) kernel along axis-0 via sliding window (no scipy)."""
+        k = kernel.shape[0]
+        pad = k // 2
+        padded = np.pad(img, ((pad, pad), (0, 0)), mode='edge')
+        out = np.zeros_like(img)
+        for i, w in enumerate(kernel[:, 0]):
+            if w != 0:
+                out += w * padded[i:i + img.shape[0], :]
+        return out
+
+    def _convolve_cols(img, kernel):
+        """Apply a (1,K) kernel along axis-1 via sliding window (no scipy)."""
+        k = kernel.shape[1]
+        pad = k // 2
+        padded = np.pad(img, ((0, 0), (pad, pad)), mode='edge')
+        out = np.zeros_like(img)
+        for i, w in enumerate(kernel[0, :]):
+            if w != 0:
+                out += w * padded[:, i:i + img.shape[1]]
+        return out
+
+    edge_y = np.abs(_convolve_rows(gray, sobel_y))  # (H, W) -- responds to h-lines
+    edge_x = np.abs(_convolve_cols(gray, sobel_x))  # (H, W) -- responds to v-lines
+
+    # Step 3: threshold -> binary maps
+    bin_y = (edge_y >= threshold).astype(np.uint8)  # foreground = horizontal edge
+    bin_x = (edge_x >= threshold).astype(np.uint8)  # foreground = vertical edge
+
+    min_h_px = max(1, int(min_length_ratio * img_w))
+    min_v_px = max(1, int(min_length_ratio * img_h))
+
+    # Step 4+5: run-length encoding per row/column -> bboxes
+    def _rle_runs(row):
+        """Return list of (start, end) inclusive pixel indices of foreground runs."""
+        runs = []
+        in_run = False
+        start = 0
+        for x, v in enumerate(row):
+            if v and not in_run:
+                start = x
+                in_run = True
+            elif not v and in_run:
+                runs.append((start, x - 1))
+                in_run = False
+        if in_run:
+            runs.append((start, len(row) - 1))
+        return runs
+
+    h_lines = []
+    for row_idx in range(img_h):
+        runs = _rle_runs(bin_y[row_idx])
+        for x_start, x_end in runs:
+            if x_end - x_start + 1 < min_h_px:
+                continue
+            # Clamp bbox thickness in Y to max_thickness
+            y_px1 = max(0, row_idx - max_thickness // 2)
+            y_px2 = min(img_h - 1, row_idx + max_thickness // 2)
+            x1 = x_start * sx
+            y1 = y_px1 * sy
+            x2 = (x_end + 1) * sx
+            y2 = (y_px2 + 1) * sy
+            h_lines.append([x1, y1, x2, y2])
+
+    v_lines = []
+    for col_idx in range(img_w):
+        runs = _rle_runs(bin_x[:, col_idx])
+        for y_start, y_end in runs:
+            if y_end - y_start + 1 < min_v_px:
+                continue
+            x_px1 = max(0, col_idx - max_thickness // 2)
+            x_px2 = min(img_w - 1, col_idx + max_thickness // 2)
+            x1 = x_px1 * sx
+            y1 = y_start * sy
+            x2 = (x_px2 + 1) * sx
+            y2 = (y_end + 1) * sy
+            v_lines.append([x1, y1, x2, y2])
+
+    return h_lines, v_lines
+
+
+def extract_lsd_line_from_image(page_img, page_width, page_height,
+                                angle_threshold=10.0, min_length_ratio=0.03):
+    """
+    Detect horizontal and vertical lines from a rasterized page image using
+    OpenCV's Line Segment Detector (LSD). Requires cv2; raises ImportError
+    with install instructions if not available.
+
+    LSD differs from Sobel + RLE in several important ways:
+      - Operates directly on gradient fields via region growing; line segments
+        are returned as first-class geometric objects rather than per-row/column
+        edge responses that must be stitched together afterward.
+      - A thick filled-rect line produces ONE segment (the center line), not
+        two near-duplicate edge responses -- eliminates the near-duplicate
+        problem that makes dtable_img_line dependent on merge_lines for
+        correctness rather than just consolidation.
+      - Faint or blurry lines: LSD accumulates gradient evidence across the
+        full extent of a region, so a line that is too faint to cross a global
+        threshold row-by-row is still detected if it is geometrically coherent.
+      - Broken/dashed lines: each unbroken segment is returned separately.
+        Callers that need to bridge gaps should still pass results through
+        merge_lines(), but the input fragment count is much lower than Sobel's.
+
+    Only horizontal and vertical segments are returned. Diagonal segments
+    (which LSD also detects) are discarded via angle_threshold.
+
+    Coordinate output format is identical to extract_sobel_line_from_image():
+    list of [x1, y1, x2, y2] in PDF point space. This allows callers to
+    treat both functions interchangeably.
+
+    Args:
+        page_img:         np.ndarray (H, W, C) uint8 -- page raster image as
+                          stored in data_dict['image'].
+        page_width:       float -- PDF page width in points (data_dict['page_width']).
+        page_height:      float -- PDF page height in points (data_dict['page_height']).
+        angle_threshold:  float -- max deviation from 0/90 degrees (in degrees)
+                          for a segment to be classified as horizontal or
+                          vertical. 10.0 absorbs slight perspective / rendering
+                          tilt while keeping diagonals out. Tune down (e.g. 5.0)
+                          for very clean PDF renders; tune up (e.g. 15.0) for
+                          scanned documents with registration skew.
+        min_length_ratio: float -- minimum segment length as a fraction of the
+                          relevant page dimension (page_width for h-lines,
+                          page_height for v-lines). Matches the default used by
+                          extract_sobel_line_from_image() (0.03 = 3%) so that
+                          the two functions produce comparable output when used
+                          as drop-in alternatives.
+
+    Returns:
+        h_lines: list of [x1, y1, x2, y2] in PDF point space (horizontal segments).
+        v_lines: list of [x1, y1, x2, y2] in PDF point space (vertical segments).
+
+    Raises:
+        ImportError: if cv2 (opencv-python or opencv-python-headless) is not installed.
+        AttributeError: if the installed OpenCV build does not include
+            cv2.createLineSegmentDetector (very old or stripped builds).
+    """
+    try:
+        import cv2
+    except ImportError:
+        raise ImportError(
+            "cv2 (OpenCV) is required for extract_lsd_line_from_image but is not installed. "
+            "Install it with: pip install opencv-python-headless"
+        )
+
+    img_h, img_w = page_img.shape[0], page_img.shape[1]
+
+    # Step 1: grayscale (luminance-weighted, same as extract_sobel_line_from_image)
+    if page_img.ndim == 3 and page_img.shape[2] >= 3:
+        gray = (0.299 * page_img[:, :, 0].astype(np.float32)
+                + 0.587 * page_img[:, :, 1].astype(np.float32)
+                + 0.114 * page_img[:, :, 2].astype(np.float32)).astype(np.uint8)
+    else:
+        gray = page_img[:, :, 0] if page_img.ndim == 3 else page_img
+
+    # Step 2: LSD detection.
+    # LSD_REFINE_STD: standard refinement -- merges nearly-collinear segments
+    # that belong to the same edge into one. Better for long table ruling lines
+    # than LSD_REFINE_NONE (too fragmented) or LSD_REFINE_ADV (slower, marginal
+    # gain on axis-aligned lines).
+    try:
+        lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
+    except AttributeError:
+        raise AttributeError(
+            "cv2.createLineSegmentDetector is not available in this OpenCV build. "
+            "Install opencv-python or opencv-python-headless >= 3.4."
+        )
+    detected, *_ = lsd.detect(gray)
+    # detected shape varies by OpenCV build:
+    #   (N, 1, 4) float32 -- most OpenCV 4.x builds
+    #   (N, 4)    float32 -- some builds / versions
+    # Normalize to (N, 4) so the per-segment loop works regardless.
+    if detected is None:
+        return [], []
+
+    detected = detected.reshape(-1, 4)
+
+    # Scale factors: pixel -> PDF points (same convention as Sobel counterpart)
+    sx = page_width / img_w
+    sy = page_height / img_h
+
+    min_h_len_px = min_length_ratio * img_w   # absolute pixel length floor for h-lines
+    min_v_len_px = min_length_ratio * img_h   # absolute pixel length floor for v-lines
+
+    h_lines = []
+    v_lines = []
+
+    for seg in detected:                       # iterate over (N, 4)
+        x1_px, y1_px, x2_px, y2_px = seg
+
+        dx = x2_px - x1_px
+        dy = y2_px - y1_px
+        length_px = (dx * dx + dy * dy) ** 0.5
+        if length_px == 0:
+            continue
+
+        # Angle from horizontal, in degrees: 0 = right, 90 = down.
+        angle_deg = abs(np.degrees(np.arctan2(abs(dy), abs(dx))))
+
+        if angle_deg <= angle_threshold:
+            # Horizontal segment: length runs along x.
+            if length_px < min_h_len_px:
+                continue
+            # Normalise: ensure x1 <= x2; y is the mean of both endpoints
+            # (LSD already returns them in draw order, but may vary).
+            lx1, lx2 = sorted((x1_px, x2_px))
+            ly = (y1_px + y2_px) / 2.0
+            h_lines.append([
+                lx1 * sx,
+                ly * sy,
+                lx2 * sx,
+                ly * sy,
+            ])
+
+        elif angle_deg >= (90.0 - angle_threshold):
+            # Vertical segment: length runs along y.
+            if length_px < min_v_len_px:
+                continue
+            ly1, ly2 = sorted((y1_px, y2_px))
+            lx = (x1_px + x2_px) / 2.0
+            v_lines.append([
+                lx * sx,
+                ly1 * sy,
+                lx * sx,
+                ly2 * sy,
+            ])
+        # else: diagonal -- discard
+
+    return h_lines, v_lines
+
+
 def _find_connected_component_regions(binary_mask, connectivity=8, min_area_threshold=10):
     """
     Find connected components in a binary mask and return their bounding boxes.

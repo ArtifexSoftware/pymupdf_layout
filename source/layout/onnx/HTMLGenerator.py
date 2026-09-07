@@ -115,7 +115,7 @@ class HTMLGenerator:
         self.title     = title
         self._n_workers = n_workers
         self._worker_args = (
-            model.config_path,
+            model.model_config_path,
             model.model_path,
             model.imf_model_path,
             model.feature_set_name,

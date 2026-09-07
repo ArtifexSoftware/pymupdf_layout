@@ -42,6 +42,19 @@ ONNX output layout varies by training flags (dec_all branch):
     [6] text_logits -- (1, 2, H, W)
     [7] thresh_map  -- (1, 1, H, W)  adaptive threshold in [0, 1]
     [8] db_map      -- (1, 1, H, W)  differentiable binary map in [0, 1]
+
+Calling contract:
+    predict(page_img) must be called explicitly by the caller for every page,
+    exactly once per page, BEFORE is_image_page() / is_ocr_needed() are used.
+    Neither method runs inference itself -- they only read the state set by
+    the most recent predict() call, plus a data_dict (from
+    create_input_data_from_page()) for the page-level signals they
+    additionally need:
+        predict(page_img)
+        is_image_page(data_dict)   # or: is_ocr_needed(data_dict)
+    This guarantees predict() runs exactly once per page and that both query
+    methods always observe the current page's state (see BoxRFDGNN.predict()
+    for the call site that owns this sequencing).
 """
 
 import numpy as np
@@ -658,46 +671,117 @@ class ImageFeatureExtractorV2:
         """
         return self._logits
 
-    def is_image_page(self, page) -> bool:
+    def is_image_page(self, data_dict) -> bool:
         """
         Determine whether the page is an image-only PDF page that requires OCR.
 
         Returns True only when ALL three conditions hold:
-          1. The page contains at least one raster image (pymupdf).
-          2. The page contains no embedded selectable text (pymupdf).
+          1. The page contains at least one raster image.
+          2. The page contains no embedded selectable text.
           3. The FCOS model detects at least one non-picture region
              (text, table, header, etc.) with score > _SCORE_FINE_THR.
 
-        Calls predict() internally and marks the result as cached so the
-        immediately following BoxRFDGNN.predict() skips re-running inference.
+        Contract: predict() must already have been called for this page
+        before calling this method (this method does not run inference
+        itself). Callers should follow the pattern:
+            feature_extractor.predict(page_img)
+            feature_extractor.is_image_page(data_dict)
         Picture detection is deferred to get_picture_detections() if needed.
 
         Args:
-            page : PyMuPDF page object
+            data_dict: output of create_input_data_from_page(), providing
+                       'has_raster_image' and 'has_embedded_text' (raw,
+                       input_type-independent page-level signals).
 
         Returns:
             bool
         """
         # Condition 1: page must contain at least one raster image
-        if not page.get_image_info():
+        if not data_dict['has_raster_image']:
             return False
 
         # Condition 2: page must have no embedded selectable text
-        if page.get_text("text").strip():
+        if data_dict['has_embedded_text']:
             return False
-
-        # Run ONNX inference on the page pixmap and cache the result
-        pix        = page.get_pixmap()
-        bytes_data = np.frombuffer(pix.samples, dtype=np.uint8)
-        page_img   = bytes_data.reshape(pix.height, pix.width, pix.n)
-
-        self.predict(page_img)
-        self.mark_cached()
 
         # Condition 3: FCOS must detect at least one non-picture region
         self._ensure_non_picture_detections()
 
         return self._detections_non_picture['boxes'].shape[0] > 0
+
+    def is_ocr_needed(self, data_dict, iou_threshold: float = 0.2) -> bool | None:
+        """
+        Estimate whether the page likely needs OCR by comparing PDF-extracted
+        bbox positions against the text segmentation probability map.
+
+        Unlike is_image_page() -- which detects fully scanned pages with no
+        embedded text at all -- this method also catches pages where PDF
+        parsing has only partially extracted the text (some regions missing).
+
+        Contract: predict() must already have been called for this page
+        before calling this method (this method does not run inference
+        itself). Callers should follow the pattern:
+            feature_extractor.predict(page_img)
+            feature_extractor.is_ocr_needed(data_dict)
+
+        Args:
+            data_dict     : output of create_input_data_from_page() for this
+                            same page (provides 'image' and 'bboxes').
+            iou_threshold : mask IoU below this value triggers True.
+                            0.0 = no overlap at all (definitely needs OCR).
+                            1.0 = perfect overlap  (definitely does not).
+                            Default 0.2.
+
+        Returns:
+            True  -- low overlap; page likely needs OCR.
+            False -- sufficient overlap; OCR probably not needed.
+            None  -- model was not exported with use_text_seg=True;
+                     capability unavailable.
+        """
+        if self._text_logits is None:
+            # Model does not support text segmentation.
+            return None
+
+        try:
+            page_image = data_dict['image']
+            img_h, img_w = page_image.shape[:2]
+
+            # Build bbox binary mask at page image resolution.
+            # Only include bboxes whose box_type is 'text'; skip all others
+            # (e.g. 'table_img_line') because they are not PDF-extracted text
+            # and would produce spurious mask coverage that inflates IoU.
+            box_types = data_dict.get('box_type', [None] * len(data_dict['bboxes']))
+            bbox_mask = np.zeros((img_h, img_w), dtype=np.bool_)
+            for (x0, y0, x1, y1), box_type in zip(data_dict['bboxes'], box_types):
+                if not isinstance(box_type, str) or box_type != 'text':
+                    continue
+                r0 = max(0, int(y0))
+                r1 = min(img_h, int(np.ceil(y1)))
+                c0 = max(0, int(x0))
+                c1 = min(img_w, int(np.ceil(x1)))
+                if r1 > r0 and c1 > c0:
+                    bbox_mask[r0:r1, c0:c1] = True
+
+            # Resize text_prob to page image resolution and binarize.
+            text_seg  = self.get_text_segmentation()
+            text_prob = text_seg['text_prob']   # (H_feat, W_feat) float32
+            feat_h, feat_w = text_prob.shape
+            if feat_h != img_h or feat_w != img_w:
+                row_idx = (np.arange(img_h) * feat_h / img_h).astype(np.int32)
+                col_idx = (np.arange(img_w) * feat_w / img_w).astype(np.int32)
+                text_prob = text_prob[np.ix_(row_idx, col_idx)]
+            text_mask = text_prob >= 0.5
+
+            # Both masks empty: no text in PDF or image -> no OCR needed.
+            intersection = np.count_nonzero(bbox_mask & text_mask)
+            union        = np.count_nonzero(bbox_mask | text_mask)
+            iou = intersection / union if union > 0 else 1.0
+            result = bool(iou < iou_threshold)
+
+            return result
+
+        except Exception:
+            return None
 
     def get_picture_detections(self) -> list:
         """
@@ -894,7 +978,7 @@ class ImageFeatureExtractorV2:
         }
 
 
-    def get_text_detection(self, db_thresh: float = 0.5,
+    def get_text_detection(self, db_thresh: float = 0.3,
                            min_area: int = 10) -> list:
         """
         Extract text bounding boxes from the DB binary map.

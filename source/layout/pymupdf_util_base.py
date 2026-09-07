@@ -466,18 +466,79 @@ def create_stext_page(page, flags):
 
 
 def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
-                          max_image_num=500, max_vec_line_num=200):
+                          max_image_num=500, max_vec_line_num=200, page_img=None):
     """
     Extract basic PDF elements without any feature extraction.
 
     Args:
         page: PyMuPDF page object
-        input_type: Tuple of element types to extract ('text', 'image', 'picture_clusters', 'vec_line')
+        input_type: Tuple of element types to extract ('text', 'image',
+            'picture_clusters', 'vec_line', 'img_line', 'table_vec_line',
+            'table_vec_line_full', 'table_vec_line_partial',
+            'table_img_line', 'table_img_line_full',
+            'table_img_line_partial', 'table_rect_full',
+            'img_table_rect_full'). 'vec_line'
+            adds every detected PDF vector line as an element;
+            'img_line' is the page-wide image-based counterpart: it
+            runs Sobel edge detection on the rasterized page image and
+            adds every detected horizontal/vertical line as a bbox --
+            useful for PDFs where lines are encoded as filled rects,
+            background colors, or embedded images rather than explicit
+            vector drawings, which 'vec_line' misses entirely. Raw Sobel
+            output is cached (data_dict['image_lines_raw']) and merged
+            lines cached (data_dict['image_lines']) for reuse by
+            'table_img_line*', 'img_table_rect_full', and
+            'dtable_img_line' in the same pipeline call.
+            'table_vec_line' instead adds only the vec_line lines that
+            belong to a validated table structure (closed border, or
+            border open on one side, always with at least one internal
+            row/column divider) -- both shapes together.
+            'table_vec_line_full' restricts this to closed-
+            border tables only, 'table_vec_line_partial' to open-sided
+            tables only (see find_table_grids' table_type parameter in
+            pymupdf_util_table.py). 'table_rect_full' also restricts to
+            closed-border tables only, but adds ONE bbox per table (the
+            table's outer bbox) instead of the individual border/divider
+            lines -- see apply_table_rect_full() in
+            pymupdf_util_table.py; intended to test whether GNN
+            performance holds up with far fewer nodes per table than
+            'table_vec_line_full'. 'img_table_rect_full' is the same
+            idea sourced from Sobel image-based lines instead of PDF
+            vector paths -- the image-based counterpart of
+            'table_rect_full', exactly as 'table_img_line' is to
+            'table_vec_line' (see apply_img_table_rect_full()).
+            'table_img_line'/'table_img_line_full'/'table_img_line_partial'
+            mirror the table_vec_line family but built on top of
+            img_line's raw output, with looser tolerances to account for
+            image-detection noise. The implementation of the
+            table_vec_line*/table_img_line* family (find_table_grids and
+            the extraction blocks themselves) lives in
+            pymupdf_util_table.py, not here -- this function only
+            dispatches to it, to keep this (model-agnostic,
+            PDF-engineer-owned) module free of table-grid-heuristic
+            details. Their detector-based counterparts,
+            'dtable_vec_line'/'dtable_img_line', are NOT handled here at
+            all -- since they require feature_extractor (a CV model),
+            they are dispatched separately as a "Step 1.5" by
+            pymupdf_util.py, after this function returns (see
+            pymupdf_util_table.apply_detector_table_lines()). All of
+            these are independent and can be combined, though for most
+            GNN layout use cases picking one line source (vec vs. img)
+            and one granularity (raw vs. table-filtered, full vs.
+            partial, heuristic vs. detector) is preferable to avoid
+            duplicate/near-duplicate line bboxes for the same table.
         max_image_num: Maximum number of images to extract
         max_vec_line_num: Maximum number of vector lines to extract
+        page_img: Optional pre-rasterized (H, W, C) uint8 page image. When
+            provided, page.get_pixmap() is not called again here -- pass this
+            whenever the caller already rasterized the page (e.g. BoxRFDGNN
+            already needed it for feature_extractor.predict()), to avoid
+            redundant rasterization of the same page.
 
     Returns:
-        data_dict: Dictionary with 'bboxes', 'text', 'box_type', 'page_width', 'page_height', 'image', 'stext_page'
+        data_dict: Dictionary with 'bboxes', 'text', 'box_type', 'page_width',
+            'page_height', 'image', 'stext_page', 'has_raster_image',
+            'has_embedded_text'
     """
     data_dict = {
         'bboxes': [],
@@ -491,10 +552,20 @@ def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
     data_dict['page_width'] = page_width
     data_dict['page_height'] = page_height
 
-    # Extract page image
-    pix = page.get_pixmap()
-    bytes_data = np.frombuffer(pix.samples, dtype=np.uint8)
-    page_img = bytes_data.reshape(pix.height, pix.width, pix.n)
+    # Raw page-level signals used by ImageFeatureExtractorV1/V2.is_image_page()
+    # and is_ocr_needed(). These must be computed unconditionally, independent
+    # of input_type, since they answer questions about the raw PDF page itself
+    # ("does it contain a raster image", "does it have embedded selectable
+    # text") rather than about which element types the caller asked to
+    # extract into bboxes/text.
+    data_dict['has_raster_image'] = bool(page.get_image_info())
+    data_dict['has_embedded_text'] = bool(page.get_text("text").strip())
+
+    # Extract page image (reuse caller-provided rasterization if available)
+    if page_img is None:
+        pix = page.get_pixmap()
+        bytes_data = np.frombuffer(pix.samples, dtype=np.uint8)
+        page_img = bytes_data.reshape(pix.height, pix.width, pix.n)
     data_dict['image'] = page_img
 
     # Create structured text page
@@ -639,6 +710,75 @@ def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
                     data_dict['text'].append('')
                     box_type.append(BOX_VLINE)
 
+    # Extract image-based lines ('img_line'): Sobel edge detection over the
+    # rasterized page image, page-wide -- the image-based counterpart of
+    # 'vec_line'. Raw Sobel output is cached in data_dict['image_lines_raw']
+    # and merged lines in data_dict['image_lines'] so that downstream
+    # consumers ('table_img_line*', 'img_table_rect_full', 'dtable_img_line')
+    # can reuse them without re-running Sobel on the same page image.
+    if 'img_line' in input_type:
+        from .pymupdf_util_table import apply_img_line
+        apply_img_line(page, data_dict, box_type, page_width, page_height, max_vec_line_num)
+
+    # Extract table lines ('table_vec_line'/'table_vec_line_full'/
+    # 'table_vec_line_partial', 'table_img_line'/'table_img_line_full'/
+    # 'table_img_line_partial') and their detector-based counterparts
+    # ('dtable_vec_line'/'dtable_img_line' are dispatched separately,
+    # from pymupdf_util.py, since they need feature_extractor -- see
+    # pymupdf_util_table.py's module docstring). Implementation lives in
+    # pymupdf_util_table.py, not here, so this (model-agnostic) module
+    # stays free of table-grid-heuristic details. Imported lazily to
+    # avoid a circular import at module load time: pymupdf_util_table
+    # imports get_vector_lines/merge_lines/BOX_HLINE/BOX_VLINE from this
+    # module at its own module top.
+    #
+    # The plain 'table_vec_line'/'table_img_line' values map to
+    # table_type='all' (fully closed + open-sided tables), matching the
+    # original (pre-table_type) behavior. The '_full'/'_partial' suffixed
+    # values request only one table shape. More than one of these can be
+    # requested at once (e.g. both '_full' and '_partial') -- each
+    # present value triggers its own call, and results accumulate in
+    # data_dict rather than the last call overwriting the previous one
+    # (see apply_table_vec_line/apply_table_img_line). The key set here
+    # is duplicated from pymupdf_util_table.VEC_LINE_TABLE_TYPES /
+    # IMG_LINE_TABLE_TYPES (just the input_type strings, not the mapping
+    # itself) so this check does not need to import that module -- the
+    # module is only imported lazily below, once we know it is actually
+    # needed, to avoid the circular import noted above.
+    #
+    # 'table_rect_full' is a separate, simpler sibling: it adds ONE bbox
+    # per fully closed table (find_table_grids' outer bbox) instead of
+    # every individual border/divider line, to test whether a single
+    # coarse table-region node keeps GNN performance while using far
+    # fewer nodes than table_vec_line_full for the same table.
+    _table_line_input_types = (
+        'table_vec_line', 'table_vec_line_full', 'table_vec_line_partial',
+        'table_img_line', 'table_img_line_full', 'table_img_line_partial',
+    )
+    if any(k in input_type for k in _table_line_input_types):
+        from .pymupdf_util_table import (
+            apply_table_vec_line, apply_table_img_line,
+            VEC_LINE_TABLE_TYPES, IMG_LINE_TABLE_TYPES,
+        )
+
+        for key, table_type in VEC_LINE_TABLE_TYPES.items():
+            if key in input_type:
+                apply_table_vec_line(page, data_dict, box_type, page_width, page_height, max_vec_line_num, table_type=table_type)
+
+        for key, table_type in IMG_LINE_TABLE_TYPES.items():
+            if key in input_type:
+                apply_table_img_line(page, data_dict, box_type, page_width, page_height, max_vec_line_num, table_type=table_type)
+
+    if 'table_rect_full' in input_type:
+        from .pymupdf_util_table import apply_table_rect_full
+
+        apply_table_rect_full(page, data_dict, box_type, page_width, page_height)
+
+    if 'img_table_rect_full' in input_type:
+        from .pymupdf_util_table import apply_img_table_rect_full
+
+        apply_img_table_rect_full(page, data_dict, box_type, page_width, page_height)
+
     # Extract text
     if 'text' in input_type or 'text_pm' in input_type:
         if 'text_pm' in input_type:
@@ -672,6 +812,7 @@ BOX_IMAGE = 'image'
 BOX_HLINE = 'h-line-vector'
 BOX_VLINE = 'v-line-vector'
 BOX_CHECKBOX = 'check-box'
+BOX_TABLE = 'table'
 
 
 def make_custom_feature(box_type_str, text=''):
@@ -686,6 +827,7 @@ def make_custom_feature(box_type_str, text=''):
     is_image = 1 if box_type_str == BOX_IMAGE else 0
     is_hline_vector = 1 if box_type_str == BOX_HLINE else 0
     is_vline_vector = 1 if box_type_str == BOX_VLINE else 0
+    is_table = 1 if box_type_str == BOX_TABLE else 0
 
     if len(text) > 0:
         num_count = sum(1 for c in text if c.isdigit())
@@ -700,6 +842,7 @@ def make_custom_feature(box_type_str, text=''):
         'is_image': is_image,
         'is_hline_vector': is_hline_vector,
         'is_vline_vector': is_vline_vector,
+        'is_table': is_table,
         'is_line': is_text,                             # legacy alias
         'is_vector': is_hline_vector + is_vline_vector, # legacy alias
     }

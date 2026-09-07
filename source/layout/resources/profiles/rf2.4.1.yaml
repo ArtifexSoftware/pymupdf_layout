@@ -1,0 +1,16 @@
+# rf2.4.1 profile: rule-feature-only model.
+# Replaces the old hardcoded branch: feature_set_name == 'rf'.
+
+feature_set_name: rf
+
+config_filename: layout_rf2.4.1.yaml
+model_filename: layout_rf2.4.1.onnx
+
+imf_model_filename: feature_imf1.onnx
+table_grid_path: null
+
+table_grid_model_ver: V1
+input_type: null
+
+use_gpu: false
+use_sort: false
