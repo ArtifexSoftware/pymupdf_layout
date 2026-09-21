@@ -230,6 +230,24 @@ def build():
 
 # Define PyMuPDF-layout package.
 #
+
+def get_requires_for_build_wheel(config_settings=None):
+    ret = list()
+    ret.append(f'pymupdf-core=={g_pymupdf_version}')
+    
+    if PYMUPDF_LAYOUT_SETUP_SWIG:
+        pass
+    elif pipcl.darwin() and pipcl.python_version_tuple() < (3, 13):
+        # 2025-10-27: new swig-4.4.0 fails badly at runtime.
+        # Note that we must use the same version of swig as pymupdf, otherwise
+        # our tgif extension module will not know about pymupdf.mupdf's types.
+        ret.append(f'swig==4.3.1')
+    else:
+        ret.append('swig')
+    log(f'get_requires_for_build_wheel(): returning: {ret=}')
+    return ret
+
+
 p = pipcl.Package(
         'pymupdf-layout',
         g_version,
@@ -274,23 +292,6 @@ p = pipcl.Package(
 
 build_wheel = p.build_wheel
 build_sdist = p.build_sdist
-
-
-def get_requires_for_build_wheel(config_settings=None):
-    ret = list()
-    ret.append(f'pymupdf=={g_pymupdf_version}')
-    
-    if PYMUPDF_LAYOUT_SETUP_SWIG:
-        pass
-    elif pipcl.darwin() and pipcl.python_version_tuple() < (3, 13):
-        # 2025-10-27: new swig-4.4.0 fails badly at runtime.
-        # Note that we must use the same version of swig as pymupdf, otherwise
-        # our tgif extension module will not know about pymupdf.mupdf's types.
-        ret.append(f'swig==4.3.1')
-    else:
-        ret.append('swig')
-    log(f'get_requires_for_build_wheel(): returning: {ret=}')
-    return ret
 
 
 if __name__ == '__main__':
