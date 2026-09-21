@@ -1340,10 +1340,19 @@ class BoxRFDGNN:
         # ------------------------------------------------------------------
         if return_raw:
             return {
-                'groups':    groups,
-                'needs_ocr': needs_ocr,
-                'node_feat': onnx_node_feat,
-                'edge_feat': onnx_edge_feat,
+                'groups':               groups,
+                'needs_ocr':            needs_ocr,
+                'node_feat':            onnx_node_feat,
+                'edge_feat':            onnx_edge_feat,
+                # Raw node bboxes and their predicted class labels/scores,
+                # indexed in the same order as edge_index columns.
+                'node_bboxes':          data_dict['bboxes'],
+                'node_labels':          predicted_node_label,
+                'node_scores':          predicted_node_score,
+                # edge_index: shape (E, 2) -- each row is (src, dst) node index.
+                # predicted_edge_labels: shape (E,) -- 1 means connected, 0 means not.
+                'edge_index':           edge_index,
+                'predicted_edge_labels': predicted_edge_labels,
             }
 
         return det_result
