@@ -161,7 +161,7 @@ def _test_activate(call_activate, install_opencv):
         # We run a separate python script so we can control imports etc.
         argv0 = os.path.normpath(f'{__file__}/../../tests/activate.py')
         print(f'{pymupdf.mupdf_version_tuple=}')
-        if pymupdf.mupdf_version_tuple < (1, 29):
+        if pymupdf.mupdf_version_tuple < (1, 28, 5):
             md_path_expected = os.path.normpath(f'{__file__}/../../tests/test_activate_expected_1.28.md')
         else:
             md_path_expected = os.path.normpath(f'{__file__}/../../tests/test_activate_expected.md')
