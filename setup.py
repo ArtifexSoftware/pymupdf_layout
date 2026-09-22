@@ -45,7 +45,7 @@ if 1:
 
 # Define our package version number.
 #
-g_version = '1.28.2'
+g_version = '2.0'
 
 # We build with, and run with, a particular PyMuPDF version usually, but not
 # always, the same as our version.
