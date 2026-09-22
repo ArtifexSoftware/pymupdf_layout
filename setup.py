@@ -252,7 +252,7 @@ p = pipcl.Package(
         'pymupdf-layout',
         g_version,
         requires_dist = [
-                f'PyMuPDF=={g_pymupdf_version}' if g_pymupdf_version else None,
+                f'pymupdf_core=={g_pymupdf_version}' if g_pymupdf_version else None,
                 'pyyaml',
                 'numpy',
                 'onnxruntime',
