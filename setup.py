@@ -16,6 +16,9 @@ Environment variables:
     PYMUPDF_LAYOUT_SETUP_VSGRADE
         Specific Visual Studio, must be one of 'Community', 'Professional',
         'Enterprise'.
+
+    PYMUPDF_SETUP_PY_LIMITED_API
+        If not '0', we build for current Python's stable ABI.
 '''
 
 import pipcl
@@ -65,6 +68,10 @@ if PYMUPDF_LAYOUT_SETUP_BUILD_PYMUPDF:
     g_pymupdf_version = None
 
 PYMUPDF_LAYOUT_SETUP_SWIG = os.environ.get('PYMUPDF_LAYOUT_SETUP_SWIG')
+
+PYMUPDF_SETUP_PY_LIMITED_API = os.environ.get('PYMUPDF_SETUP_PY_LIMITED_API')
+g_py_limited_api = (PYMUPDF_SETUP_PY_LIMITED_API != '0')
+    
 
 def build():
 
@@ -160,7 +167,7 @@ def build():
                 libpaths=libpaths,
                 libs=libs,
                 linker_extra=linker_extra,
-                py_limited_api=1,
+                py_limited_api=g_py_limited_api,
                 debug=(PYMUPDF_LAYOUT_SETUP_BUILD_TYPE == 'debug'),
                 optimise=(PYMUPDF_LAYOUT_SETUP_BUILD_TYPE != 'debug'),
                 swig=PYMUPDF_LAYOUT_SETUP_SWIG,
@@ -183,7 +190,7 @@ def build():
             libpaths=libpaths,
             libs=libs,
             linker_extra=linker_extra,
-            py_limited_api=1,
+            py_limited_api=g_py_limited_api,
             debug=(PYMUPDF_LAYOUT_SETUP_BUILD_TYPE == 'debug'),
             optimise=(PYMUPDF_LAYOUT_SETUP_BUILD_TYPE != 'debug'),
             swig=PYMUPDF_LAYOUT_SETUP_SWIG,
@@ -286,7 +293,7 @@ p = pipcl.Package(
         author_email = 'support@artifex.com',
         requires_python = '>=3.10',
         fn_build = build,
-        py_limited_api = True,
+        py_limited_api = g_py_limited_api,
         )
 
 
