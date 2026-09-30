@@ -35,5 +35,5 @@ While other tools train machine learning models on rendered page images, PyMuPDF
 
 ## Documentation
 
-**PyMuPDF Layout** is a component of [PyMuPDF4LLM](https://github.com/pymupdf/pymupdf4llm), see the [PyMuPDF4LLM documentation page](https://pymupdf.readthedocs.io/en/latest/pymupdf4llm)
+**PyMuPDF Layout** is a component of [PyMuPDF4LLM](https://github.com/pymupdf/pymupdf4llm), see the [PyMuPDF4LLM documentation page](https://pymupdf.readthedocs.io/en/latest/pymupdf4llm).
 
