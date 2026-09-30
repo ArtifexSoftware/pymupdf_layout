@@ -163,9 +163,13 @@ def _test_activate(call_activate, install_opencv):
         print(f'{pymupdf.mupdf_version_tuple=}')
         if pymupdf.mupdf_version_tuple < (1, 28, 5):
             md_path_expected = os.path.normpath(f'{__file__}/../../tests/test_activate_expected_1.28.md')
-        else:
+        elif pymupdf.mupdf_version_tuple < (1, 29):
             md_path_expected = os.path.normpath(f'{__file__}/../../tests/test_activate_expected.md')
-        md_path_out = os.path.normpath(f'{__file__}/../../tests/test_activate_{call_activate}_out.md')
+        else:
+            md_path_expected = os.path.normpath(f'{__file__}/../../tests/test_activate_expected_1.29.md')
+        print(f'{md_path_expected=}')
+        md_path_out = os.path.normpath(f'{__file__}/../../tests/test_activate_{call_activate}_{install_opencv}_out.md')
+        print(f'{md_path_out=}', flush=1)
         if os.path.isfile(md_path_out):
             os.remove(md_path_out)
         subprocess.run(f'{sys.executable} {argv0} {call_activate} {md_path_out}', shell=1, check=1)
