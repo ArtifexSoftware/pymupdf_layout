@@ -6,11 +6,7 @@ import textwrap
 import subprocess
 import time
 
-sys.path.insert(0, os.path.abspath(f'{__file__}/../..'))
-try:
-    import pipcl
-finally:
-    del sys.path[0]
+import pipcl
 
 import pymupdf
 import pymupdf.features
@@ -210,17 +206,19 @@ def test_activate_yes_opencv():
 
 def test_show_build_info():
     print()
+    print(f'Not doing anything because there is no longer a real pymupdf_layout package.')
+    return
+    
+    # 2026-10-05: Preserving this old code for now, just in case we ever need
+    # to use a separate pymupdf_layout package.
+    #
     # Get pymupdf.layout version with importlib because it is only present in
     # >=1.26.7.
     import importlib
     layout_version = importlib.metadata.version('pymupdf.layout')
+    
     print(f'{layout_version=}')
-    def int_or_str(s):
-        try:
-            return int(s)
-        except Exception:
-            return s
-    layout_version_tuple = tuple([int_or_str(i) for i in layout_version.split('.')])
+    layout_version_tuple = pipcl.version_to_tuple(layout_version)
     print(f'{layout_version_tuple=}')
     if layout_version_tuple >= (1, 26, 7):
         # Everything should be present.
