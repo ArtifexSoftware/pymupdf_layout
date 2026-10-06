@@ -21,6 +21,8 @@ Environment variables:
         If not '0', we build for current Python's stable ABI.
 '''
 
+raise Exception('pymupdf_layout can no longer be built into a package')
+
 import pipcl
 
 import glob
