@@ -1,0 +1,84 @@
+model:
+  backbone:
+    type: UNet
+    in_ch: 1
+    num_filters: 64
+    num_enc_stages: 6
+    use_sep: false
+    dropout_rate: 0.1
+    blocks_per_stage: 2
+    max_filters: 256
+    stem_filters: 16
+    head_filters: 32
+    context: psp
+    psp_bins:
+    - 1
+    - 2
+    - 5
+  transformer:
+    n_global_blocks: 1
+    t_heads: 4
+    t_mlp_ratio: 2.0
+    layer_scale_init: 0.1
+  stage1:
+    num_classes: 12
+    use_det: true
+    det_mid_ch: 64
+  stage2:
+    stage1_feat_type: dec-all
+    stage1_det_attach: true
+    dec_all_attach: true
+    feature_set:
+    - geo-edge
+    - margin
+    - nn_geo
+    image_feat:
+      mask_embed_dim: 128
+      border_embed_dim: 64
+    geo_feat:
+      node_geo_dim: 64
+      node_content_dim: 32
+      edge_geo_dim: 32
+      layer_norm: batch
+    graph:
+      attention_type: Node
+      nn_k: 10
+      attention_layers_num: 1
+      num_node_classes: 11
+      num_edge_classes: 2
+      roi_pool_size: 7
+      use_node_attn: true
+      node_attn_heads: 4
+      node_aggr: low_level_concat
+      node_hidden_dim: 256
+      edge_type: concat
+      hard_only: false
+data:
+  class_list:
+  - text
+  - title
+  - picture
+  - table
+  - list-item
+  - page-header
+  - page-footer
+  - section-header
+  - footnote
+  - caption
+  - formula
+  det_classes:
+  - picture
+  - table
+  - formula
+  table_class_idx: 3
+  vertical_gap: 0.3
+  class_change_map:
+    table-cell: null
+    form: table
+    key-value-region: text
+    checkbox-selected: text
+    checkbox-unselected: text
+    code: text
+  image_size:
+  - 250
+  - 250
