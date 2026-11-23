@@ -9,6 +9,8 @@ import numpy as np
 import pymupdf
 from collections import defaultdict
 
+from . import pymupdf_util_watermark
+
 
 def get_vector_lines(page, omit_invisible=True):
     """Return horizontal and vertical vector lines on a page.
@@ -466,7 +468,7 @@ def create_stext_page(page, flags):
 
 
 def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
-                          max_image_num=500, max_vec_line_num=200):
+                          max_image_num=500, max_vec_line_num=200, remove_watermarks=None):
     """
     Extract basic PDF elements without any feature extraction.
 
@@ -475,6 +477,9 @@ def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
         input_type: Tuple of element types to extract ('text', 'image', 'picture_clusters', 'vec_line')
         max_image_num: Maximum number of images to extract
         max_vec_line_num: Maximum number of vector lines to extract
+        remove_watermarks: Leave watermark text out of the text page and the
+            page image (see pymupdf_util_watermark). None means
+            pymupdf_util_watermark.REMOVE_WATERMARKS.
 
     Returns:
         data_dict: Dictionary with 'bboxes', 'text', 'box_type', 'page_width', 'page_height', 'image', 'stext_page'
@@ -540,6 +545,26 @@ def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
 
 
     stext_page = create_stext_page(page, stext_flags)
+
+    # A watermark over the page content distorts the prediction. If there is
+    # one, make the text page and the page image again without its text.
+    blocks = None
+    if remove_watermarks is None:
+        remove_watermarks = pymupdf_util_watermark.REMOVE_WATERMARKS
+    if remove_watermarks and 'text_pm' not in input_type:
+        blocks = page.get_text("dict", textpage=stext_page)["blocks"]
+        watermark_lines = pymupdf_util_watermark.find_watermark_lines(blocks, page.rect)
+        if watermark_lines:
+            try:
+                clean_page, pix = pymupdf_util_watermark.page_without_lines(page, stext_flags, watermark_lines)
+            except Exception as e:
+                # Not worth failing the prediction: go on with the page as it is.
+                pymupdf.message(f'Watermark text stays in the layout input: {e}')
+            else:
+                stext_page = clean_page
+                bytes_data = np.frombuffer(pix.samples, dtype=np.uint8)
+                data_dict['image'] = bytes_data.reshape(pix.height, pix.width, pix.n)
+                blocks = None  # to be read from the new text page
     data_dict['stext_page'] = stext_page
 
     if False:
@@ -643,7 +668,7 @@ def extract_base_elements(page, input_type=('text',), feature_set_name='rf',
     if 'text' in input_type or 'text_pm' in input_type:
         if 'text_pm' in input_type:
             blocks = page.get_text("dict")["blocks"]
-        else:
+        elif blocks is None:
             blocks = page.get_text("dict", textpage=stext_page)["blocks"]
         text_extract(data_dict, box_type, page_width, page_height, blocks)
 
