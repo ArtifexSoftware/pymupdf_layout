@@ -929,6 +929,7 @@ class BoxRFDGNN:
                 'input_type': self.input_type,
                 'feature_set_name': self.feature_set_name,
                 'feature_extractor': self.feature_extractor,
+                'remove_watermarks': kwargs.get('remove_watermarks'),
             })
             bboxes = np.array(data_dict['bboxes'], dtype=np.float32)
 
@@ -1081,6 +1082,7 @@ class BoxRFDGNN:
                              'input_type': self.input_type,
                              'feature_set_name': self.feature_set_name,
                              'feature_extractor': self.feature_extractor,
+                             'remove_watermarks': kwargs.get('remove_watermarks'),
                          })
                          bboxes = np.array(data_dict['bboxes'], dtype=np.float32)
 

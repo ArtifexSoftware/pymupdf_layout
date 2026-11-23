@@ -13,6 +13,7 @@ Options dict keys (with defaults):
     max_vec_line_num    : int     = 200             — Maximum number of vector lines to extract
     feature_extractor   : object  = None            — ONNX model for image-based feature extraction
     bbox_num_threshold  : int     = 0               — Return early if bbox count exceeds this (0 = disabled)
+    remove_watermarks   : bool    = None            — Leave watermark text out of the input (None = module default)
 """
 
 import os
@@ -48,6 +49,7 @@ def create_input_data_from_page(page, options=None):
     max_vec_line_num = options.get('max_vec_line_num', 200)
     feature_extractor = options.get('feature_extractor', None)
     bbox_num_threshold = options.get('bbox_num_threshold', 0)
+    remove_watermarks = options.get('remove_watermarks', None)
 
     # Step 1: Extract base PDF elements
     data_dict = extract_base_elements(
@@ -55,6 +57,7 @@ def create_input_data_from_page(page, options=None):
         input_type=input_type,
         max_image_num=max_image_num,
         max_vec_line_num=max_vec_line_num,
+        remove_watermarks=remove_watermarks,
     )
 
     # Early return check
